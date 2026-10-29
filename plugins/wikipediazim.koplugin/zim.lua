@@ -232,6 +232,18 @@ function ZIM:findUrlIndex(namespace, target_url)
     return lo, false
 end
 
+-- Exact match lookup using binary search. Returns directory entry or nil.
+function ZIM:findExact(namespace, target_url)
+    local idx, exact = self:findUrlIndex(namespace, target_url)
+    if exact then
+        local entry = self:getEntryByIndex(idx)
+        if entry and entry.kind ~= "deleted" then
+            return entry
+        end
+    end
+    return nil
+end
+
 -- Walk forward from the insertion point collecting entries whose namespace
 -- matches and whose url starts with the prefix. Stops at the first miss.
 function ZIM:prefixSearch(namespace, prefix, max_results)

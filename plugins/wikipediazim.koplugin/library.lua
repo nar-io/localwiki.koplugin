@@ -138,6 +138,24 @@ function Library:prefixSearch(namespace, prefix, max_results)
     return out
 end
 
+-- Find exact matches across all logical ZIMs. Each result gets `_base` set.
+function Library:findExact(namespace, target_url)
+    local out = {}
+    for _, e in ipairs(self.zims) do
+        local z, err = self:open(e.base)
+        if z then
+            local hit = z:findExact(namespace, target_url)
+            if hit then
+                hit._base = e.base
+                out[#out + 1] = hit
+            end
+        else
+            logger.warn("wikipediazim: skipping " .. e.base .. ": " .. tostring(err))
+        end
+    end
+    return out
+end
+
 -- Number of *opened* (i.e. file-handle-active) ZIMs — for diagnostics.
 function Library:openedCount()
     local n = 0

@@ -82,6 +82,103 @@ function WikipediaZim:init()
     end
 
     self.ui.menu:registerToMainMenu(self)
+    self:registerSelectionHooks()
+    self:onDispatcherRegisterActions()
+    if self.ui and self.ui.registerPostInitCallback then
+        self.ui:registerPostInitCallback(function()
+            self:registerSelectionHooks()
+        end)
+    end
+end
+
+function WikipediaZim:onReaderReady()
+    self:registerSelectionHooks()
+end
+
+function WikipediaZim:registerSelectionHooks()
+    self:addToHighlightDialog()
+    self:registerDictButtons()
+    self:hookWikipediaModule()
+end
+
+function WikipediaZim:addToHighlightDialog()
+    if not self.ui or not self.ui.highlight then return end
+    self.ui.highlight:addToHighlightDialog("05_wikipedia_offline", function(this)
+        return {
+            id = "wikipedia_offline",
+            text = _("Offline Wikipedia"),
+            show_in_highlight_dialog_func = function()
+                return true
+            end,
+            callback = function()
+                if this.hold_pos and not this.selected_text then
+                    this:highlightFromHoldPos()
+                end
+                local raw_text = this.selected_text and this.selected_text.text
+                local ok_util, util = pcall(require, "util")
+                if ok_util and util and util.cleanupSelectedText and raw_text then
+                    raw_text = util.cleanupSelectedText(raw_text)
+                end
+                this:onClose()
+                if raw_text and raw_text ~= "" then
+                    self:searchFromSelection(raw_text)
+                end
+            end,
+        }
+    end)
+end
+
+function WikipediaZim:registerDictButtons()
+    if not self.ui or not self.ui.dictionary then return end
+    self.ui.dictionary:addToDictButtons({
+        id = "wikipedia_offline",
+        menu_text = _("Offline Wikipedia"),
+        text = _("Offline Wikipedia"),
+        can_shrink = true,
+        pairs_with = "wikipedia",
+        conditional = true,
+        callback = function(dict_popup)
+            local word = dict_popup.lookupword or dict_popup.word
+            if (not word or word == "") and dict_popup.highlight and dict_popup.highlight.selected_text then
+                word = dict_popup.highlight.selected_text.text
+            end
+            dict_popup:onClose(true)
+            if word and word ~= "" then
+                self:searchFromSelection(word)
+            end
+        end,
+    })
+end
+
+function WikipediaZim:hookWikipediaModule()
+    if not self.ui or not self.ui.wikipedia then return end
+    if self._wikipedia_hooked then return end
+    self._wikipedia_hooked = true
+    local orig_onLookupWikipedia = self.ui.wikipedia.onLookupWikipedia
+    self.ui.wikipedia.onLookupWikipedia = function(wiki_self, word, is_sane, boxes, page, lang, dict_close_callback)
+        if G_reader_settings:isTrue("wikipediazim_prefer_offline") and self:_ensureScanned() then
+            if dict_close_callback then dict_close_callback() end
+            self:searchFromSelection(word)
+            return true
+        end
+        return orig_onLookupWikipedia(wiki_self, word, is_sane, boxes, page, lang, dict_close_callback)
+    end
+end
+
+function WikipediaZim:onDispatcherRegisterActions()
+    local ok_disp, Dispatcher = pcall(require, "dispatcher")
+    if ok_disp and Dispatcher and Dispatcher.registerAction then
+        Dispatcher:registerAction("wikipediazim_search", {
+            category = "none",
+            event = "SearchOfflineWikipedia",
+            title = _("Search Offline Wikipedia"),
+            general = true,
+        })
+    end
+end
+
+function WikipediaZim:onSearchOfflineWikipedia(text)
+    self:searchFromSelection(text)
 end
 
 function WikipediaZim:_folder()
@@ -155,6 +252,15 @@ function WikipediaZim:_buildSubMenu()
             callback = function() self:chooseFolder() end,
         },
         {
+            text = _("Use for default 'Wikipedia' button"),
+            checked_func = function()
+                return G_reader_settings:isTrue("wikipediazim_prefer_offline")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("wikipediazim_prefer_offline")
+            end,
+        },
+        {
             text_func = function() return _("Folder: ") .. self:_folder() end,
             enabled_func = function() return false end,
         },
@@ -212,11 +318,149 @@ end
 
 -- ---------- search ----------
 
+-- UTF-8 safe first character extraction (returns first UTF-8 char and remainder)
+local function utf8_first_char(s)
+    if not s or #s == 0 then return "", "" end
+    local b1 = s:byte(1)
+    local len = 1
+    if b1 >= 0xC0 and b1 <= 0xDF then len = 2
+    elseif b1 >= 0xE0 and b1 <= 0xEF then len = 3
+    elseif b1 >= 0xF0 and b1 <= 0xF7 then len = 4
+    end
+    if #s < len then len = #s end
+    return s:sub(1, len), s:sub(len + 1)
+end
+
+-- UTF-8 safe string truncation (avoids cutting in the middle of multi-byte code points)
+local function utf8_truncate(s, max_len)
+    if not s or #s <= max_len then return s end
+    local cut = max_len
+    while cut > 0 and (s:byte(cut) >= 0x80 and s:byte(cut) < 0xC0) do
+        cut = cut - 1
+    end
+    if cut > 0 then
+        local b = s:byte(cut)
+        local char_len = 1
+        if b >= 0xC0 and b <= 0xDF then char_len = 2
+        elseif b >= 0xE0 and b <= 0xEF then char_len = 3
+        elseif b >= 0xF0 and b <= 0xF7 then char_len = 4
+        end
+        if cut + char_len - 1 > max_len then
+            cut = cut - 1
+        end
+    end
+    return s:sub(1, cut):gsub("%s+$", "")
+end
+
+-- Generate search candidate URLs supporting Unicode, Turkish characters,
+-- multiword phrases, and title-cased variants.
+function WikipediaZim:_getSearchCandidates(query)
+    local candidates = {}
+    local seen = {}
+    local function add(c)
+        if c and c ~= "" and not seen[c] then
+            seen[c] = true
+            candidates[#candidates + 1] = c
+        end
+    end
+
+    local q = query:gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+    if q == "" then return candidates end
+
+    local raw_url = q:gsub(" ", "_")
+    local first_char, rest = utf8_first_char(raw_url)
+
+    -- Determine uppercase variants for first character
+    local uppers = {}
+    if first_char == "i" then
+        -- Turkish: 'i' -> 'İ' (U+0130, \196\176); English/standard: 'i' -> 'I'
+        uppers[#uppers + 1] = "\196\176"
+        uppers[#uppers + 1] = "I"
+    elseif first_char == "\196\177" then -- Turkish dotless 'ı' -> 'I'
+        uppers[#uppers + 1] = "I"
+    elseif first_char == "\196\176" then -- 'İ'
+        uppers[#uppers + 1] = "\196\176"
+        uppers[#uppers + 1] = "I"
+    elseif first_char == "I" then
+        uppers[#uppers + 1] = "I"
+        uppers[#uppers + 1] = "\196\176"
+    elseif first_char == "\195\167" then -- ç -> Ç
+        uppers[#uppers + 1] = "\195\135"
+    elseif first_char == "\196\159" then -- ğ -> Ğ
+        uppers[#uppers + 1] = "\196\158"
+    elseif first_char == "\195\182" then -- ö -> Ö
+        uppers[#uppers + 1] = "\195\150"
+    elseif first_char == "\197\159" then -- ş -> Ş
+        uppers[#uppers + 1] = "\197\158"
+    elseif first_char == "\195\188" then -- ü -> Ü
+        uppers[#uppers + 1] = "\195\156"
+    elseif #first_char == 1 and first_char >= "a" and first_char <= "z" then
+        uppers[#uppers + 1] = first_char:upper()
+    else
+        uppers[#uppers + 1] = first_char
+    end
+
+    -- 1. Sentence-capitalized candidates (first character uppercase)
+    for _, u in ipairs(uppers) do
+        add(u .. rest)
+    end
+
+    -- 2. Title-cased candidate (if multiple words)
+    if raw_url:find("_", 1, true) then
+        local words = {}
+        for word in raw_url:gmatch("[^_]+") do
+            local w_first, w_rest = utf8_first_char(word)
+            local w_up = w_first
+            if w_first == "i" then w_up = "I"
+            elseif w_first == "\196\177" then w_up = "I"
+            elseif w_first == "\195\167" then w_up = "\195\135"
+            elseif w_first == "\196\159" then w_up = "\196\158"
+            elseif w_first == "\195\182" then w_up = "\195\150"
+            elseif w_first == "\197\159" then w_up = "\197\158"
+            elseif w_first == "\195\188" then w_up = "\195\156"
+            elseif #w_first == 1 and w_first >= "a" and w_first <= "z" then
+                w_up = w_first:upper()
+            end
+            words[#words + 1] = w_up .. w_rest
+        end
+        add(table.concat(words, "_"))
+
+        -- Turkish title-cased candidate if any word starts with i or ı
+        local tr_words = {}
+        local has_tr = false
+        for word in raw_url:gmatch("[^_]+") do
+            local w_first, w_rest = utf8_first_char(word)
+            local w_up = w_first
+            if w_first == "i" then
+                w_up = "\196\176" -- 'İ'
+                has_tr = true
+            elseif w_first == "\196\177" then
+                w_up = "I"
+                has_tr = true
+            elseif w_first == "\195\167" then w_up = "\195\135"
+            elseif w_first == "\196\159" then w_up = "\196\158"
+            elseif w_first == "\195\182" then w_up = "\195\150"
+            elseif w_first == "\197\159" then w_up = "\197\158"
+            elseif w_first == "\195\188" then w_up = "\195\156"
+            elseif #w_first == 1 and w_first >= "a" and w_first <= "z" then
+                w_up = w_first:upper()
+            end
+            tr_words[#tr_words + 1] = w_up .. w_rest
+        end
+        if has_tr then
+            add(table.concat(tr_words, "_"))
+        end
+    end
+
+    -- 3. Raw URL as typed/selected (e.g. for "iPhone", "eBay")
+    add(raw_url)
+
+    return candidates
+end
+
 local function query_to_url(q)
-    q = q:gsub("^%s+", ""):gsub("%s+$", "")
-    q = q:gsub(" ", "_")
-    if #q > 0 then q = q:sub(1, 1):upper() .. q:sub(2) end
-    return q
+    local cands = WikipediaZim._getSearchCandidates(nil, q)
+    return cands[1] or ""
 end
 
 local function url_decode(s)
@@ -224,17 +468,19 @@ local function url_decode(s)
     return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
 end
 
-function WikipediaZim:openSearchDialog()
+function WikipediaZim:openSearchDialog(initial_query, custom_title)
     if not self:_ensureScanned() then
         UIManager:show(InfoMessage:new{
             text = string.format(_("No ZIM files in:\n%s"), self:_folder()),
         })
         return
     end
+    local q_init = initial_query or self.last_search or ""
+    local title = custom_title or _("Search Wikipedia")
     local dialog
     dialog = InputDialog:new{
-        title = _("Search Wikipedia"),
-        input = self.last_search or "",
+        title = title,
+        input = q_init,
         input_hint = _("Article title prefix"),
         buttons = {{
             { text = _("Cancel"), id = "close",
@@ -252,15 +498,77 @@ function WikipediaZim:openSearchDialog()
     dialog:onShowKeyboard()
 end
 
+function WikipediaZim:searchFromSelection(text)
+    if type(text) ~= "string" then return end
+    local ok_util, util = pcall(require, "util")
+    if ok_util and util and util.cleanupSelectedText then
+        local ok, clean = pcall(util.cleanupSelectedText, text)
+        if ok and clean then text = clean end
+    end
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then return end
+
+    -- Safe truncation for excessively long selections (max 256 bytes)
+    text = utf8_truncate(text, 256)
+    if text == "" then return end
+
+    self.last_search = text
+    self:runSearch(text)
+end
+
 function WikipediaZim:runSearch(query)
-    if not self:_ensureScanned() then return end
-    local url = query_to_url(query)
-    if url == "" then return end
-    local results = self.library:prefixSearch("C", url, 60)
-    if #results == 0 then
-        UIManager:show(InfoMessage:new{ text = _("No matches for: ") .. query })
+    if not self:_ensureScanned() then
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("No ZIM files in:\n%s"), self:_folder()),
+        })
         return
     end
+
+    if type(query) ~= "string" then return end
+    query = query:gsub("^%s+", ""):gsub("%s+$", "")
+    if query == "" then return end
+    query = utf8_truncate(query, 256)
+    if query == "" then return end
+
+    self.last_search = query
+
+    local candidates = self:_getSearchCandidates(query)
+    local results = {}
+    local seen_keys = {}
+
+    -- 1. Prefer exact title matches across all ZIMs
+    for _, cand in ipairs(candidates) do
+        local exact_hits = self.library:findExact("C", cand)
+        for _, hit in ipairs(exact_hits) do
+            local key = (hit._base or "") .. ":" .. (hit.url or "")
+            if not seen_keys[key] then
+                seen_keys[key] = true
+                results[#results + 1] = hit
+            end
+        end
+    end
+
+    -- 2. Fall back to title-prefix search if no exact match or to supplement results
+    local max_results = 60
+    for _, cand in ipairs(candidates) do
+        if #results >= max_results then break end
+        local prefix_hits = self.library:prefixSearch("C", cand, max_results - #results)
+        for _, hit in ipairs(prefix_hits) do
+            local key = (hit._base or "") .. ":" .. (hit.url or "")
+            if not seen_keys[key] then
+                seen_keys[key] = true
+                results[#results + 1] = hit
+                if #results >= max_results then break end
+            end
+        end
+    end
+
+    -- 3. If no results found, inform user and allow modifying query
+    if #results == 0 then
+        self:openSearchDialog(query, string.format(_("No matches for “%s”. Modify search:"), query))
+        return
+    end
+
     self:showResultsMenu(results, query)
 end
 
@@ -280,13 +588,19 @@ function WikipediaZim:showResultsMenu(results, query)
             callback = function() self:openEntry(entry, true) end,
         }
     end
-    local menu = Menu:new{
+    local menu
+    menu = Menu:new{
         title = string.format(_("Results for “%s” (%d)"), query, #results),
         item_table = menu_items,
         is_borderless = true,
         is_popout = false,
         width = Device.screen:getWidth(),
         height = Device.screen:getHeight(),
+        title_bar_left_icon = "search",
+        onLeftButtonTap = function()
+            UIManager:close(menu)
+            self:openSearchDialog(query)
+        end,
     }
     UIManager:show(menu)
 end
