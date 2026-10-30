@@ -82,14 +82,24 @@ function M.clean(html)
     html = html:gsub("<script[^>]*>.-</script>", "")
     html = html:gsub("<style[^>]*>.-</style>", "")
     html = html:gsub("<noscript[^>]*>.-</noscript>", "")
-    html = html:gsub("<svg[^>]*>.-</svg>", "")
-    html = html:gsub("<picture[^>]*>.-</picture>", "")
-    html = html:gsub("<figure[^>]*>.-</figure>", "")
     html = html:gsub("<audio[^>]*>.-</audio>", "")
     html = html:gsub("<video[^>]*>.-</video>", "")
-    html = html:gsub("<img[^>]*>", "")
+    html = html:gsub("</?picture[^>]*>", "")
     html = html:gsub("<link[^>]*>", "")
     html = html:gsub("<meta[^>]*>", "")
+
+    -- Extract lead image from infobox table if present,
+    -- converting it to a standard figure so the picture is preserved when the table is stripped.
+    local lead_fig = nil
+    local infobox = html:match('<table[^>]-class="[^"]-infobox[^"]-"[^>]*>(.-)</table>')
+    if infobox then
+        local img_tag = infobox:match('(<img%s+[^>]+>)')
+        if img_tag then
+            local cap = infobox:match('<[^>]-class="[^"]-infobox%-caption[^"]-"[^>]*>(.-)</[^>]+>')
+            lead_fig = string.format('<figure class="mw-halign-right">%s%s</figure>',
+                img_tag, cap and ("<figcaption>" .. cap .. "</figcaption>") or "")
+        end
+    end
 
     -- (3) Nesting blocks — balanced removal.
     html = strip_balanced(html, "<table[%s>]", "<table", "</table>")
@@ -112,6 +122,16 @@ function M.clean(html)
     html = strip_balanced(html,
         '<ol%s+[^>]-class="[^"]-references[^"]-"',
         "<ol", "</ol>")
+
+    -- If an infobox lead figure was salvaged, place it right before the first paragraph
+    if lead_fig then
+        local p_start = html:find("<p[%s>]")
+        if p_start then
+            html = html:sub(1, p_start - 1) .. lead_fig .. html:sub(p_start)
+        else
+            html = lead_fig .. html
+        end
+    end
 
     -- (4) Empty placeholders.
     html = html:gsub('<p[^>]-class="[^"]-mw%-empty[^"]-"[^>]*>.-</p>', "")

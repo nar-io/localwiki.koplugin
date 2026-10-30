@@ -87,6 +87,48 @@ local function makeCss(face, spacing, margin_em)
         ul,ol{ margin:0.25em 0 0.45em 1em; padding:0; }
         sup,sub{ font-size:75%%; }
         .reference,.mw-editsection,.noprint{ display:none; }
+        figure, .thumb, .thumbinner {
+            float: right;
+            clear: right;
+            margin: 0.4em 0 0.6em 0.8em;
+            padding: 3px;
+            border: 1px solid #c8ccd1;
+            background-color: #f8f9fa;
+            max-width: 48%%;
+            box-sizing: border-box;
+            display: block;
+        }
+        figure.mw-halign-left, .tleft {
+            float: left;
+            clear: left;
+            margin: 0.4em 0.8em 0.6em 0;
+        }
+        figure.mw-halign-center, .tcenter, .tnone {
+            float: none;
+            clear: both;
+            margin: 0.5em auto;
+            display: block;
+            text-align: center;
+        }
+        img {
+            max-width: 100%%;
+            height: auto;
+            display: block;
+            margin: 0 auto;
+        }
+        figcaption, .thumbcaption {
+            font-size: 0.82em;
+            line-height: 1.25;
+            padding: 4px 2px 2px;
+            text-align: left;
+            color: #333;
+            display: block;
+        }
+        .mwe-math-fallback-image-inline {
+            display: inline-block;
+            vertical-align: middle;
+            margin: 0 0.1em;
+        }
     ]], m, family, spacing)
 end
 

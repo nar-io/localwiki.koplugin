@@ -33,13 +33,13 @@ class TestLuaSyntaxAndIntegrity(unittest.TestCase):
     """Verify that all modified Lua files are well-formed and follow conventions."""
 
     def test_lua_files_exist(self):
-        for fname in ["main.lua", "library.lua", "zim.lua", "viewer.lua", "_meta.lua"]:
+        for fname in ["main.lua", "library.lua", "zim.lua", "viewer.lua", "_meta.lua", "htmlclean.lua"]:
             fpath = os.path.join(PLUGIN_DIR, fname)
             self.assertTrue(os.path.isfile(fpath), f"Missing expected plugin file: {fname}")
 
     def test_lua_syntax_balanced_blocks(self):
         """Check for basic syntax block balancing."""
-        lua_files = ["main.lua", "library.lua", "zim.lua", "viewer.lua", "_meta.lua"]
+        lua_files = ["main.lua", "library.lua", "zim.lua", "viewer.lua", "_meta.lua", "htmlclean.lua"]
         for fname in lua_files:
             fpath = os.path.join(PLUGIN_DIR, fname)
             with open(fpath, "r", encoding="utf-8") as f:
@@ -678,6 +678,77 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
         self.assertIn('_("Set Wikipedia folder…")', content)
 
 
+class TestWikipediaImageSupport(unittest.TestCase):
+    """Verify that images and figures are preserved, styled, and embedded like original Wikipedia."""
+
+    def test_htmlclean_preserves_images_and_figures(self):
+        with open(os.path.join(PLUGIN_DIR, "htmlclean.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Must not strip figure, picture, or img tags from article body
+        self.assertNotIn("html:gsub('<figure.-/figure>', '')", src)
+        self.assertNotIn("html:gsub('<picture.-/picture>', '')", src)
+        self.assertNotIn("html:gsub('<img[^>]*>', '')", src)
+
+        # Unwraps <picture> wrappers while retaining inner <img>
+        self.assertIn('html = html:gsub("</?picture[^>]*>", "")', src)
+
+    def test_htmlclean_infobox_lead_image_salvaged(self):
+        with open(os.path.join(PLUGIN_DIR, "htmlclean.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Infoboxes are scanned for lead images and converted to figures before table removal
+        self.assertIn('local infobox = html:match(\'<table[^>]-class="[^"]-infobox[^"]-"[^>]*>(.-)</table>\')', src)
+        self.assertIn('<figure class="mw-halign-right">', src)
+        self.assertIn("<figcaption>", src)
+
+    def test_image_resolution_and_data_uri_pipeline(self):
+        with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Multi-tiered base64 encoder
+        self.assertIn("local function base64_encode(data)", src)
+        self.assertIn("ffi/sha2", src)
+        self.assertIn("bin_to_base64", src)
+
+        # Image blob resolver checking C, I, - namespaces and normalized paths
+        self.assertIn("function WikipediaZim:_resolveImageBlob(z, src)", src)
+        self.assertIn('ns = "C"', src)
+        self.assertIn('ns = "I"', src)
+        self.assertIn('ns = "-"', src)
+        self.assertIn("image/jpeg", src)
+        self.assertIn("image/png", src)
+        self.assertIn("image/webp", src)
+        self.assertIn("image/svg+xml", src)
+
+        # Lead image extraction from main page / index
+        self.assertIn("function WikipediaZim:_getLeadImageForArticle(z, article_url)", src)
+        self.assertIn("getMainPageEntry()", src)
+
+        # Embed images as Base64 data URIs
+        self.assertIn("function WikipediaZim:_embedImagesInHtml(z, html, article_url)", src)
+        self.assertIn('"data:" .. mime .. ";base64," .. b64', src)
+
+        # Inlining called in both popup lookup and full viewer
+        self.assertIn("self:_embedImagesInHtml(z, cleaned, resolved.url or entry.url)", src)
+
+    def test_wikipedia_thumbnail_css_styling(self):
+        with open(os.path.join(PLUGIN_DIR, "viewer.lua"), "r", encoding="utf-8") as f:
+            v_src = f.read()
+        with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
+            m_src = f.read()
+
+        for content in [v_src, m_src]:
+            self.assertIn("figure, .thumb, .thumbinner", content)
+            self.assertIn("float: right", content)
+            self.assertIn("border: 1px solid #c8ccd1", content)
+            self.assertIn("background-color: #f8f9fa", content)
+            self.assertIn("max-width: 48%", content)
+            self.assertIn("figure.mw-halign-left", content)
+            self.assertIn("figcaption, .thumbcaption", content)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

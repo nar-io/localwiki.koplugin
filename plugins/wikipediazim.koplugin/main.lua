@@ -606,6 +606,190 @@ function WikipediaZim:runSearch(query, boxes, dict_close_callback)
     self:showInLookupWindow(results, query, boxes, dict_close_callback)
 end
 
+local function base64_encode(data)
+    if not data or data == "" then return "" end
+    local ok_sha2, sha2 = pcall(require, "ffi/sha2")
+    if ok_sha2 and sha2 and sha2.bin_to_base64 then
+        local ok, res = pcall(sha2.bin_to_base64, data)
+        if ok and res then return res end
+    end
+    local ok_bit, bit = pcall(require, "bit")
+    local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    if ok_bit and bit then
+        local band, rshift, lshift = bit.band, bit.rshift, bit.lshift
+        local bytes = { string.byte(b64chars, 1, 64) }
+        local len = #data
+        local t = {}
+        local pad = len % 3
+        local clean_len = len - pad
+        for i = 1, clean_len, 3 do
+            local b1, b2, b3 = data:byte(i, i + 2)
+            local n = lshift(b1, 16) + lshift(b2, 8) + b3
+            t[#t + 1] = string.char(
+                bytes[rshift(n, 18) + 1],
+                bytes[band(rshift(n, 12), 63) + 1],
+                bytes[band(rshift(n, 6), 63) + 1],
+                bytes[band(n, 63) + 1]
+            )
+        end
+        if pad == 1 then
+            local b1 = data:byte(len)
+            local n = lshift(b1, 16)
+            t[#t + 1] = string.char(
+                bytes[rshift(n, 18) + 1],
+                bytes[band(rshift(n, 12), 63) + 1],
+                61, 61
+            )
+        elseif pad == 2 then
+            local b1, b2 = data:byte(len - 1, len)
+            local n = lshift(b1, 16) + lshift(b2, 8)
+            t[#t + 1] = string.char(
+                bytes[rshift(n, 18) + 1],
+                bytes[band(rshift(n, 12), 63) + 1],
+                bytes[band(rshift(n, 6), 63) + 1],
+                61
+            )
+        end
+        return table.concat(t)
+    end
+    return ((data:gsub('.', function(x)
+        local r,b='',x:byte()
+        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+        return r
+    end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+        if #x < 6 then return '' end
+        local c=0
+        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
+        return b64chars:sub(c+1,c+1)
+    end)..({ '', '==', '=' })[#data%3+1])
+end
+
+function WikipediaZim:_resolveImageBlob(z, src)
+    if not z or not src or src == "" then return nil end
+    if src:match("^https?://") or src:match("^data:") then return nil end
+
+    src = src:gsub("#.*$", ""):gsub("%?.*$", "")
+    local clean = src:gsub("^%./", ""):gsub("^%.%./", ""):gsub("^/", "")
+    local decoded = url_decode(clean)
+
+    local candidates = {
+        { ns = "C", url = clean },
+        { ns = "C", url = decoded },
+        { ns = "I", url = clean },
+        { ns = "I", url = decoded },
+        { ns = "-", url = clean },
+        { ns = "-", url = decoded },
+    }
+
+    if clean:match("^I/") then
+        local sub = clean:sub(3)
+        table.insert(candidates, { ns = "I", url = sub })
+        table.insert(candidates, { ns = "I", url = url_decode(sub) })
+    end
+    if clean:match("^%-/") then
+        local sub = clean:sub(3)
+        table.insert(candidates, { ns = "-", url = sub })
+        table.insert(candidates, { ns = "-", url = url_decode(sub) })
+    end
+
+    local seen = {}
+    for _, c in ipairs(candidates) do
+        local key = c.ns .. ":" .. c.url
+        if not seen[key] then
+            seen[key] = true
+            local entry = z:findExact(c.ns, c.url)
+            if entry and entry.kind == "article" then
+                local data, mime = z:readArticle(entry)
+                if data and #data > 0 then
+                    if not mime or mime == "application/octet-stream" then
+                        local ext = c.url:match("%.([%a%d]+)$")
+                        if ext then
+                            ext = ext:lower()
+                            if ext == "jpg" or ext == "jpeg" then mime = "image/jpeg"
+                            elseif ext == "png" then mime = "image/png"
+                            elseif ext == "webp" then mime = "image/webp"
+                            elseif ext == "gif" then mime = "image/gif"
+                            elseif ext == "svg" then mime = "image/svg+xml"
+                            end
+                        end
+                    end
+                    return data, mime or "image/jpeg"
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function WikipediaZim:_getLeadImageForArticle(z, article_url)
+    if not z or not article_url or article_url == "" then return nil end
+    if not z._lead_images then
+        z._lead_images = {}
+        local main_entry = z:getMainPageEntry()
+        if main_entry then
+            local main_html = z:readArticle(main_entry)
+            if main_html then
+                for href, src, cap in main_html:gmatch('<a%s+class="item"%s+href="([^"]+)">%s*<figure><img[^>]+src="([^"]+)">%s*<figcaption>([^<]*)</figcaption>') do
+                    local clean_href = url_decode(href)
+                    z._lead_images[href] = { src = src, caption = cap }
+                    z._lead_images[clean_href] = { src = src, caption = cap }
+                end
+            end
+        end
+    end
+    local item = z._lead_images[article_url] or z._lead_images[url_decode(article_url)]
+    if item then
+        return item.src, item.caption
+    end
+    return nil
+end
+
+function WikipediaZim:_embedImagesInHtml(z, html, article_url)
+    if not html or html == "" then return html end
+
+    local max_images = 30
+    local count = 0
+
+    local function replace_img_src(prefix, src, suffix)
+        if count >= max_images then return prefix .. src .. suffix end
+        local data, mime = self:_resolveImageBlob(z, src)
+        if data then
+            count = count + 1
+            local b64 = base64_encode(data)
+            return prefix .. "data:" .. mime .. ";base64," .. b64 .. suffix
+        end
+        return prefix .. src .. suffix
+    end
+
+    local dq = string.char(34)
+    local sq = string.char(39)
+    local replaced_html = html:gsub("(<img%s+[^>]*src=" .. dq .. ")([^" .. dq .. "]+)(" .. dq .. ")", replace_img_src)
+    replaced_html = replaced_html:gsub("(<img%s+[^>]*src=" .. sq .. ")([^" .. sq .. "]+)(" .. sq .. ")", replace_img_src)
+
+    if count == 0 and article_url and z then
+        local lead_src, caption = self:_getLeadImageForArticle(z, article_url)
+        if lead_src then
+            local data, mime = self:_resolveImageBlob(z, lead_src)
+            if data then
+                local b64 = base64_encode(data)
+                local data_uri = "data:" .. mime .. ";base64," .. b64
+                local fig = string.format(
+                    '<figure class="mw-halign-right"><img src="%s"><figcaption>%s</figcaption></figure>',
+                    data_uri, caption or ""
+                )
+                local p_start = replaced_html:find("<p[%s>]")
+                if p_start then
+                    replaced_html = replaced_html:sub(1, p_start - 1) .. fig .. replaced_html:sub(p_start)
+                else
+                    replaced_html = fig .. replaced_html
+                end
+            end
+        end
+    end
+
+    return replaced_html
+end
+
 function WikipediaZim:_loadArticleHtml(entry)
     local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
     if not base then
@@ -631,7 +815,7 @@ function WikipediaZim:_loadArticleHtml(entry)
     if not cleaned or cleaned == "" then
         cleaned = html_or_err
     end
-    return cleaned
+    return self:_embedImagesInHtml(z, cleaned, resolved.url or entry.url)
 end
 
 function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callback)
@@ -666,6 +850,50 @@ function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callb
                 is_wiki = true,
                 is_wiki_fullpage = false,
                 zim_entry = entry,
+                css = [[
+                    figure, .thumb, .thumbinner {
+                        float: right;
+                        clear: right;
+                        margin: 0.4em 0 0.6em 0.8em;
+                        padding: 3px;
+                        border: 1px solid #c8ccd1;
+                        background-color: #f8f9fa;
+                        max-width: 48%;
+                        box-sizing: border-box;
+                        display: block;
+                    }
+                    figure.mw-halign-left, .tleft {
+                        float: left;
+                        clear: left;
+                        margin: 0.4em 0.8em 0.6em 0;
+                    }
+                    figure.mw-halign-center, .tcenter, .tnone {
+                        float: none;
+                        clear: both;
+                        margin: 0.5em auto;
+                        display: block;
+                        text-align: center;
+                    }
+                    img {
+                        max-width: 100%;
+                        height: auto;
+                        display: block;
+                        margin: 0 auto;
+                    }
+                    figcaption, .thumbcaption {
+                        font-size: 0.82em;
+                        line-height: 1.25;
+                        padding: 4px 2px 2px;
+                        text-align: left;
+                        color: #333;
+                        display: block;
+                    }
+                    .mwe-math-fallback-image-inline {
+                        display: inline-block;
+                        vertical-align: middle;
+                        margin: 0 0.1em;
+                    }
+                ]],
             }
 
             if entry.definition then
@@ -867,7 +1095,11 @@ function WikipediaZim:openEntry(entry, push_history)
     end
     self.current_entry = resolved
     self.current_title = resolved.title ~= "" and resolved.title or resolved.url
-    self.current_html  = HtmlClean.clean(html)
+    local cleaned = HtmlClean.clean(html)
+    if not cleaned or cleaned == "" then
+        cleaned = html
+    end
+    self.current_html = self:_embedImagesInHtml(z, cleaned, resolved.url or entry.url)
 
     self:_showViewer()
 end
