@@ -711,6 +711,12 @@ class TestWikipediaImageSupport(unittest.TestCase):
         self.assertIn("ffi/sha2", src)
         self.assertIn("bin_to_base64", src)
 
+        # WebP / SVG to PNG converter
+        self.assertIn("local function convert_to_png(raw_data)", src)
+        self.assertIn("ui/renderimage", src)
+        self.assertIn("ffi/webp", src)
+        self.assertIn("WebPDecodeRGBA", src)
+
         # Image blob resolver checking C, I, - namespaces and normalized paths
         self.assertIn("function WikipediaZim:_resolveImageBlob(z, src)", src)
         self.assertIn('ns = "C"', src)
@@ -720,6 +726,7 @@ class TestWikipediaImageSupport(unittest.TestCase):
         self.assertIn("image/png", src)
         self.assertIn("image/webp", src)
         self.assertIn("image/svg+xml", src)
+        self.assertIn("z._img_cache", src)
 
         # Lead image extraction from main page / index
         self.assertIn("function WikipediaZim:_getLeadImageForArticle(z, article_url)", src)

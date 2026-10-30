@@ -664,32 +664,132 @@ local function base64_encode(data)
     end)..({ '', '==', '=' })[#data%3+1])
 end
 
+local function convert_to_png(raw_data)
+    if not raw_data or #raw_data == 0 then return nil end
+
+    -- Strategy 1: KOReader's RenderImage
+    local ok_ri, RenderImage = pcall(require, "ui/renderimage")
+    local bb = nil
+    if ok_ri and RenderImage and RenderImage.renderImageData then
+        bb = RenderImage:renderImageData(raw_data, #raw_data)
+    end
+
+    -- Strategy 2: Direct ffi/webp if RenderImage didn't handle it
+    if not bb and #raw_data >= 12 and raw_data:sub(1, 4) == "RIFF" and raw_data:sub(9, 12) == "WEBP" then
+        local ok_webp, WebP = pcall(require, "ffi/webp")
+        if ok_webp and WebP and WebP.fromData then
+            local ok_open, webp = pcall(WebP.fromData, raw_data, #raw_data)
+            if ok_open and webp then
+                local ok_frame, webp_bb = pcall(webp.getFrameImage, webp, 1)
+                pcall(webp.close, webp)
+                if ok_frame and webp_bb then
+                    bb = webp_bb
+                end
+            end
+        end
+    end
+
+    -- Strategy 3: Direct libwebp FFI binding if available
+    if not bb and #raw_data >= 12 and raw_data:sub(1, 4) == "RIFF" and raw_data:sub(9, 12) == "WEBP" then
+        local ok_ffi, ffi = pcall(require, "ffi")
+        if ok_ffi and ffi then
+            pcall(ffi.cdef, [[
+                uint8_t* WebPDecodeRGBA(const uint8_t* data, size_t data_size, int* width, int* height);
+                void WebPFree(void* ptr);
+            ]])
+            local ok_lib, libwebp = pcall(ffi.load, "webp")
+            if not ok_lib or not libwebp then
+                ok_lib, libwebp = pcall(ffi.load, "libwebp")
+            end
+            if ok_lib and libwebp and libwebp.WebPDecodeRGBA then
+                local w = ffi.new("int[1]")
+                local h = ffi.new("int[1]")
+                local rgba = libwebp.WebPDecodeRGBA(raw_data, #raw_data, w, h)
+                if rgba ~= nil then
+                    local ok_bb_mod, Blitbuffer = pcall(require, "ffi/blitbuffer")
+                    if ok_bb_mod and Blitbuffer then
+                        bb = Blitbuffer.new(w[0], h[0], Blitbuffer.TYPE_BBRGB32, rgba)
+                    end
+                    libwebp.WebPFree(rgba)
+                end
+            end
+        end
+    end
+
+    -- Write BlitBuffer to temporary PNG and read back encoded PNG bytes
+    if bb then
+        local tmp_dir = "/tmp"
+        local ok_ds, DataStorage = pcall(require, "datastorage")
+        if ok_ds and DataStorage and DataStorage.getDataDir then
+            tmp_dir = DataStorage:getDataDir() .. "/cache"
+            local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+            if not ok_lfs or not lfs then
+                ok_lfs, lfs = pcall(require, "lfs")
+            end
+            if ok_lfs and lfs and lfs.mkdir then
+                pcall(lfs.mkdir, tmp_dir)
+            end
+        else
+            tmp_dir = os.getenv("TEMP") or os.getenv("TMP") or "/tmp" or "."
+        end
+
+        local tmp_path = string.format("%s/wzim_%d_%d.png", tmp_dir, os.time(), math.random(1000, 9999))
+        local ok_write = pcall(bb.writePNG, bb, tmp_path)
+        pcall(bb.free, bb)
+
+        if ok_write then
+            local f = io.open(tmp_path, "rb")
+            if f then
+                local png_bytes = f:read("*all")
+                f:close()
+                pcall(os.remove, tmp_path)
+                if png_bytes and #png_bytes > 0 then
+                    return png_bytes
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
 function WikipediaZim:_resolveImageBlob(z, src)
     if not z or not src or src == "" then return nil end
     if src:match("^https?://") or src:match("^data:") then return nil end
 
+    if not z._img_cache then z._img_cache = {} end
+    if z._img_cache[src] then
+        return z._img_cache[src].data, z._img_cache[src].mime
+    end
+
     src = src:gsub("#.*$", ""):gsub("%?.*$", "")
     local clean = src:gsub("^%./", ""):gsub("^%.%./", ""):gsub("^/", "")
     local decoded = url_decode(clean)
+    local decoded2 = url_decode(decoded)
 
     local candidates = {
         { ns = "C", url = clean },
         { ns = "C", url = decoded },
+        { ns = "C", url = decoded2 },
         { ns = "I", url = clean },
         { ns = "I", url = decoded },
+        { ns = "I", url = decoded2 },
         { ns = "-", url = clean },
         { ns = "-", url = decoded },
+        { ns = "-", url = decoded2 },
     }
 
     if clean:match("^I/") then
         local sub = clean:sub(3)
         table.insert(candidates, { ns = "I", url = sub })
         table.insert(candidates, { ns = "I", url = url_decode(sub) })
+        table.insert(candidates, { ns = "I", url = url_decode(url_decode(sub)) })
     end
     if clean:match("^%-/") then
         local sub = clean:sub(3)
         table.insert(candidates, { ns = "-", url = sub })
         table.insert(candidates, { ns = "-", url = url_decode(sub) })
+        table.insert(candidates, { ns = "-", url = url_decode(url_decode(sub)) })
     end
 
     local seen = {}
@@ -697,23 +797,63 @@ function WikipediaZim:_resolveImageBlob(z, src)
         local key = c.ns .. ":" .. c.url
         if not seen[key] then
             seen[key] = true
+            if z._img_cache[key] then
+                z._img_cache[src] = z._img_cache[key]
+                return z._img_cache[key].data, z._img_cache[key].mime
+            end
+
             local entry = z:findExact(c.ns, c.url)
+            if entry and entry.kind == "redirect" then
+                entry = z:resolveRedirect(entry)
+            end
             if entry and entry.kind == "article" then
                 local data, mime = z:readArticle(entry)
                 if data and #data > 0 then
-                    if not mime or mime == "application/octet-stream" then
-                        local ext = c.url:match("%.([%a%d]+)$")
-                        if ext then
-                            ext = ext:lower()
-                            if ext == "jpg" or ext == "jpeg" then mime = "image/jpeg"
-                            elseif ext == "png" then mime = "image/png"
-                            elseif ext == "webp" then mime = "image/webp"
-                            elseif ext == "gif" then mime = "image/gif"
-                            elseif ext == "svg" then mime = "image/svg+xml"
+                    local is_native = false
+                    if #data >= 4 then
+                        local b1, b2, b3, b4 = data:byte(1, 4)
+                        if b1 == 0xFF and b2 == 0xD8 then
+                            mime = "image/jpeg"
+                            is_native = true
+                        elseif b1 == 0x89 and b2 == 0x50 and b3 == 0x4E and b4 == 0x47 then
+                            mime = "image/png"
+                            is_native = true
+                        elseif b1 == 0x47 and b2 == 0x49 and b3 == 0x46 and b4 == 0x38 then
+                            mime = "image/gif"
+                            is_native = true
+                        elseif b1 == 0x42 and b2 == 0x4D then
+                            mime = "image/bmp"
+                            is_native = true
+                        end
+                    end
+
+                    -- If format is not natively decoded by MuPDF HTML engine (e.g. WebP or SVG),
+                    -- convert it to standard PNG so MuPDF renders it seamlessly.
+                    if not is_native then
+                        local converted = convert_to_png(data)
+                        if converted and #converted > 0 then
+                            data = converted
+                            mime = "image/png"
+                        else
+                            if not mime or mime == "application/octet-stream" then
+                                local ext = c.url:match("%.([%a%d]+)$")
+                                if ext then
+                                    ext = ext:lower()
+                                    if ext == "jpg" or ext == "jpeg" then mime = "image/jpeg"
+                                    elseif ext == "png" then mime = "image/png"
+                                    elseif ext == "webp" then mime = "image/webp"
+                                    elseif ext == "gif" then mime = "image/gif"
+                                    elseif ext == "svg" then mime = "image/svg+xml"
+                                    end
+                                end
                             end
                         end
                     end
-                    return data, mime or "image/jpeg"
+
+                    local res = { data = data, mime = mime or "image/jpeg" }
+                    z._img_cache[key] = res
+                    z._img_cache[src] = res
+                    return res.data, res.mime
                 end
             end
         end
@@ -875,8 +1015,8 @@ function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callb
                         text-align: center;
                     }
                     img {
-                        max-width: 100%;
-                        height: auto;
+                        max-width: 100% !important;
+                        height: auto !important;
                         display: block;
                         margin: 0 auto;
                     }

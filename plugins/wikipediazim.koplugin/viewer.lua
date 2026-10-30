@@ -111,8 +111,8 @@ local function makeCss(face, spacing, margin_em)
             text-align: center;
         }
         img {
-            max-width: 100%%;
-            height: auto;
+            max-width: 100%% !important;
+            height: auto !important;
             display: block;
             margin: 0 auto;
         }

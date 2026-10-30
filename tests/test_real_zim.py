@@ -132,6 +132,31 @@ def main():
             prefix_titles = [e["title"] for e in prefix_hits[:5]]
             print(f"  Prefix matches (first 5): {prefix_titles}")
 
+    # Also test wikipedia_en_basketball_maxi_2026-09.zim if present
+    bball_zim = os.path.join(os.path.dirname(__file__), "..", "..", "wikipedia_en_basketball_maxi_2026-09.zim")
+    if os.path.exists(bball_zim):
+        with open(bball_zim, "rb") as bf:
+            bh = bf.read(80)
+            b_count = struct.unpack_from("<I", bh, 24)[0]
+            b_url_ptr = struct.unpack_from("<Q", bh, 32)[0]
+            print(f"\nLoaded {os.path.basename(bball_zim)}: {b_count} articles")
+
+            for q in ["Basketball", "Michael Jordan", "Stephen Curry", "Kobe Bryant"]:
+                cands = get_search_candidates(q)
+                exact_hits = []
+                for c in cands:
+                    idx, exact = find_url_index(bf, b_url_ptr, b_count, "C", c)
+                    if exact:
+                        entry = read_dirent(bf, dirent_offset(bf, b_url_ptr, idx))
+                        exact_hits.append(entry)
+                print(f"Query: '{q}' -> Exact hits: {[e['url'] for e in exact_hits]}")
+
+            # Test image resolution in basketball zim
+            sample_img = "_assets_/d1f33b1cb42dc60ec0e42c6954875701/James_Naismith_at_Springfield_College_circa_1920.jpg"
+            idx, exact = find_url_index(bf, b_url_ptr, b_count, "C", sample_img)
+            print(f"Sample image lookup ('{sample_img}'): exact={exact}, index={idx}")
+            assert exact, f"Failed to find {sample_img} in basketball ZIM!"
+
 
 if __name__ == "__main__":
     main()
