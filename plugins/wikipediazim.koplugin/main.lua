@@ -930,6 +930,226 @@ function WikipediaZim:_embedImagesInHtml(z, html, article_url)
     return replaced_html
 end
 
+function WikipediaZim:_findLeadImageSrc(html, article_url, z)
+    if not html or html == "" then return nil end
+
+    -- (1) Check infobox table
+    local infobox = html:match('<table[^>]-class="[^"]-infobox[^"]-"[^>]*>(.-)</table>')
+    if infobox then
+        local src = infobox:match('<img%s+[^>]-src="([^"]+)"') or infobox:match("<img%s+[^>]-src='([^']+)'")
+        if src then
+            local cap = infobox:match('<[^>]-class="[^"]-infobox%-caption[^"]-"[^>]*>(.-)</[^>]+>')
+            if cap then
+                cap = cap:gsub("<[^>]+>", ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+            end
+            return src, cap
+        end
+    end
+
+    -- (2) Check lead section before first heading
+    local lead = html
+    local h2 = lead:find("<h2[%s>]")
+    if not h2 then h2 = lead:find('<div%s+[^>]*class="[^"]*mw%-heading2') end
+    if not h2 then h2 = lead:find('<section%s+[^>]*data%-mw%-section%-id="[1-9]') end
+    if h2 then lead = lead:sub(1, h2) end
+
+    -- Check figure before h2
+    local fig_src, fig_cap = lead:match('<figure[^>]*>.-<img%s+[^>]-src="([^"]+)".-<figcaption[^>]*>(.-)</figcaption>.-</figure>')
+    if not fig_src then
+        fig_src, fig_cap = lead:match("<figure[^>]*>.-<img%s+[^>]-src='([^']+)'.-<figcaption[^>]*>(.-)</figcaption>.-</figure>")
+    end
+    if fig_src then
+        if fig_cap then
+            fig_cap = fig_cap:gsub("<[^>]+>", ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        end
+        return fig_src, fig_cap
+    end
+
+    -- Check simple img in figure
+    local fig_simple = lead:match('<figure[^>]*>.-<img%s+[^>]-src="([^"]+)"') or lead:match("<figure[^>]*>.-<img%s+[^>]-src='([^']+)'")
+    if fig_simple then
+        return fig_simple, nil
+    end
+
+    -- Check any img tag in lead
+    local lead_img = lead:match('<img%s+[^>]-src="([^"]+)"') or lead:match("<img%s+[^>]-src='([^']+)'")
+    if lead_img then
+        return lead_img, nil
+    end
+
+    -- (3) Check main page lead images index
+    if z and article_url then
+        local lead_src, cap = self:_getLeadImageForArticle(z, article_url)
+        if lead_src then
+            return lead_src, cap
+        end
+    end
+
+    return nil
+end
+
+function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article_url)
+    if not z then return nil end
+    local show_image = G_reader_settings:nilOrTrue("wikipedia_show_image")
+    if not show_image then return nil end
+
+    local src, caption = self:_findLeadImageSrc(raw_html, article_url, z)
+    if not src and cleaned_html then
+        src, caption = self:_findLeadImageSrc(cleaned_html, article_url, z)
+    end
+    if not src then return nil end
+
+    local data, mime = self:_resolveImageBlob(z, src)
+    if not data or #data == 0 then return nil end
+
+    local ok_ri, RenderImage = pcall(require, "ui/renderimage")
+    if not ok_ri or not RenderImage or not RenderImage.renderImageData then
+        return nil
+    end
+
+    local target_w = 200
+    local ok_dev, Device = pcall(require, "device")
+    if ok_dev and Device and Device.screen and Device.screen.scaleBySize then
+        target_w = Device.screen:scaleBySize(180)
+    end
+
+    local bb = RenderImage:renderImageData(data, #data)
+    if not bb then return nil end
+
+    local bw = bb:getWidth()
+    local bh = bb:getHeight()
+    if bw > target_w then
+        local target_h = math.max(1, math.floor(target_w * bh / bw))
+        local scaled = RenderImage:renderImageData(data, #data, false, target_w, target_h)
+        if scaled then
+            bb:free()
+            bb = scaled
+            bw = target_w
+            bh = target_h
+        end
+    end
+
+    return {
+        {
+            width = bw,
+            height = bh,
+            caption = caption,
+            bb = bb,
+        }
+    }
+end
+
+function WikipediaZim:_extractIntroText(cleaned_html, raw_html)
+    local html = cleaned_html or raw_html or ""
+    if html == "" then return "" end
+
+    -- Find boundary of intro before first major section heading
+    local lead = html
+    local h2 = lead:find("<h2[%s>]")
+    if not h2 then
+        h2 = lead:find('<div%s+[^>]*class="[^"]*mw%-heading2')
+    end
+    if not h2 then
+        h2 = lead:find('<section%s+[^>]*data%-mw%-section%-id="[1-9]')
+    end
+    if h2 then
+        lead = lead:sub(1, h2 - 1)
+    end
+
+    -- Strip tables and figures from lead
+    lead = lead:gsub("<table.-</table>", "")
+    lead = lead:gsub("<figure.-</figure>", "")
+    lead = lead:gsub('<div%s+[^>]-class="[^"]-infobox[^"]-"[^>]*>.-</div>', "")
+    lead = lead:gsub('<div%s+[^>]-class="[^"]-thumb[^"]-"[^>]*>.-</div>', "")
+
+    local paras = {}
+    for p in lead:gmatch("<p[%s>](.-)</p>") do
+        local text = p:gsub("<[^>]+>", "")
+        -- Decode entities
+        text = text:gsub("&nbsp;", " ")
+                   :gsub("&#160;", " ")
+                   :gsub("&quot;", '"')
+                   :gsub("&amp;", "&")
+                   :gsub("&lt;", "<")
+                   :gsub("&gt;", ">")
+                   :gsub("&#39;", "'")
+                   :gsub("&ndash;", "–")
+                   :gsub("&mdash;", "—")
+                   :gsub("&#x2013;", "–")
+                   :gsub("&#x2014;", "—")
+        -- Remove citations/footnotes [1], [2], [citation needed]
+        text = text:gsub("%[%s*%d+%s*%]", "")
+        text = text:gsub("%[%s*%a%s*%]", "")
+        text = text:gsub("%[%s*citation needed%s*%]", "")
+        -- Normalize spaces
+        text = text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        if #text > 20 then
+            paras[#paras + 1] = text
+        end
+    end
+
+    if #paras == 0 then
+        local plain = lead:gsub("<[^>]+>", " ")
+                          :gsub("&nbsp;", " ")
+                          :gsub("&quot;", '"')
+                          :gsub("&amp;", "&")
+                          :gsub("&lt;", "<")
+                          :gsub("&gt;", ">")
+                          :gsub("%s+", " ")
+                          :gsub("^%s+", "")
+                          :gsub("%s+$", "")
+        if #plain > 0 then
+            paras[#paras + 1] = plain:sub(1, 1500)
+        end
+    end
+
+    local intro = table.concat(paras, "\n\n")
+    if intro == "" then
+        intro = _("No introduction.")
+    end
+
+    local full_len = raw_html and #raw_html or (cleaned_html and #cleaned_html or 0)
+    if full_len > 0 then
+        local size_kb = math.ceil(full_len / 1024)
+        intro = intro .. "\n\n" .. string.format(_("(full article : %d kB)"), size_kb)
+    end
+
+    return intro
+end
+
+function WikipediaZim:_loadArticleIntro(entry)
+    local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
+    if not base then
+        return _("Article not found."), nil
+    end
+    local z, err = self.library:open(base)
+    if not z then
+        return tostring(err or _("Failed to open ZIM.")), nil
+    end
+    local resolved = z:resolveRedirect(entry)
+    if not resolved or resolved.kind ~= "article" then
+        return _("Article not found."), nil
+    end
+    local ok, html_or_err, mime = pcall(function() return z:readArticle(resolved) end)
+    if not ok or not html_or_err then
+        return tostring(html_or_err or _("Failed to read article.")), nil
+    end
+    if not mime or not mime:match("^text/html") then
+        return _("Article is not HTML."), nil
+    end
+    resolved._base = base
+    local raw_html = html_or_err
+    local cleaned = HtmlClean.clean(raw_html)
+    if not cleaned or cleaned == "" then
+        cleaned = raw_html
+    end
+
+    local intro = self:_extractIntroText(cleaned, raw_html)
+    local images = self:_getLeadImageBlitBuffer(z, raw_html, cleaned, resolved.url or entry.url)
+
+    return intro, images, resolved
+end
+
 function WikipediaZim:_loadArticleHtml(entry)
     local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
     if not base then
@@ -957,6 +1177,51 @@ function WikipediaZim:_loadArticleHtml(entry)
     end
     return self:_embedImagesInHtml(z, cleaned, resolved.url or entry.url)
 end
+
+local DEFAULT_WIKI_CSS = [[
+    figure, .thumb, .thumbinner {
+        float: right;
+        clear: right;
+        margin: 0.4em 0 0.6em 0.8em;
+        padding: 3px;
+        border: 1px solid #c8ccd1;
+        background-color: #f8f9fa;
+        max-width: 48%;
+        box-sizing: border-box;
+        display: block;
+    }
+    figure.mw-halign-left, .tleft {
+        float: left;
+        clear: left;
+        margin: 0.4em 0.8em 0.6em 0;
+    }
+    figure.mw-halign-center, .tcenter, .tnone {
+        float: none;
+        clear: both;
+        margin: 0.5em auto;
+        display: block;
+        text-align: center;
+    }
+    img {
+        max-width: 100% !important;
+        height: auto !important;
+        display: block;
+        margin: 0 auto;
+    }
+    figcaption, .thumbcaption {
+        font-size: 0.82em;
+        line-height: 1.25;
+        padding: 4px 2px 2px;
+        text-align: left;
+        color: #333;
+        display: block;
+    }
+    .mwe-math-fallback-image-inline {
+        display: inline-block;
+        vertical-align: middle;
+        margin: 0 0.1em;
+    }
+]]
 
 function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callback)
     if not ok_dict or not DictQuickLookup then
@@ -986,69 +1251,32 @@ function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callb
             local item = {
                 dict = dict_name,
                 word = title,
-                is_html = (entry.is_html ~= false),
+                is_html = false,
                 is_wiki = true,
                 is_wiki_fullpage = false,
                 zim_entry = entry,
-                css = [[
-                    figure, .thumb, .thumbinner {
-                        float: right;
-                        clear: right;
-                        margin: 0.4em 0 0.6em 0.8em;
-                        padding: 3px;
-                        border: 1px solid #c8ccd1;
-                        background-color: #f8f9fa;
-                        max-width: 48%;
-                        box-sizing: border-box;
-                        display: block;
-                    }
-                    figure.mw-halign-left, .tleft {
-                        float: left;
-                        clear: left;
-                        margin: 0.4em 0.8em 0.6em 0;
-                    }
-                    figure.mw-halign-center, .tcenter, .tnone {
-                        float: none;
-                        clear: both;
-                        margin: 0.5em auto;
-                        display: block;
-                        text-align: center;
-                    }
-                    img {
-                        max-width: 100% !important;
-                        height: auto !important;
-                        display: block;
-                        margin: 0 auto;
-                    }
-                    figcaption, .thumbcaption {
-                        font-size: 0.82em;
-                        line-height: 1.25;
-                        padding: 4px 2px 2px;
-                        text-align: left;
-                        color: #333;
-                        display: block;
-                    }
-                    .mwe-math-fallback-image-inline {
-                        display: inline-block;
-                        vertical-align: middle;
-                        margin: 0 0.1em;
-                    }
-                ]],
+                css = DEFAULT_WIKI_CSS,
             }
 
             if entry.definition then
                 item.definition = entry.definition
+                item.images = entry.images
             elseif #dict_results == 0 then
-                -- Preload definition for the first (best match) result immediately
-                item.definition = self:_loadArticleHtml(entry)
+                -- Preload intro extract and lead image for first (best match) result immediately
+                local intro, images, resolved = self:_loadArticleIntro(entry)
+                item.definition = intro
+                item.images = images
+                if resolved then item.zim_entry = resolved end
             else
-                -- Lazy load definition for other matching articles on demand
+                -- Lazy load intro extract and lead image for other matching articles on demand
                 setmetatable(item, {
                     __index = function(t, k)
-                        if k == "definition" then
-                            local def = self:_loadArticleHtml(entry)
-                            rawset(t, "definition", def)
-                            return def
+                        if k == "definition" or k == "images" then
+                            local intro, images, resolved = self:_loadArticleIntro(entry)
+                            rawset(t, "definition", intro)
+                            rawset(t, "images", images)
+                            if resolved then rawset(t, "zim_entry", resolved) end
+                            return rawget(t, k)
                         end
                         return nil
                     end,
@@ -1066,6 +1294,7 @@ function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callb
             definition = string.format(_("No offline Wikipedia articles found for “%s”."), query),
             is_html = false,
             is_wiki = true,
+            is_wiki_fullpage = false,
         })
     end
 
@@ -1112,6 +1341,22 @@ function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callb
         end,
         dict_close_callback = dict_close_callback,
     }
+
+    -- Tapping the "Full article" button opens the complete article in Viewer
+    lookup_window.lookupWikipedia = function(lookup_self, get_fullpage, word, is_sane, lang, close_cb)
+        local cur_item = lookup_self.results and lookup_self.results[lookup_self.dict_index]
+        local entry = cur_item and cur_item.zim_entry
+        if entry then
+            lookup_self:onClose(true)
+            self:openEntry(entry, true)
+            return
+        end
+        if word and word ~= "" then
+            lookup_self:onClose(true)
+            self:searchFromSelection(word, lookup_self.word_boxes)
+        end
+    end
+
     self.lookup_window = lookup_window
     UIManager:show(lookup_window)
 end

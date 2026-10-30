@@ -618,9 +618,14 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
         self.assertIn("is_offline_wiki = true", content)
 
         # Best match first + Lazy loading metatable pattern for remaining results
-        self.assertIn("item.definition = self:_loadArticleHtml(entry)", content)
-        self.assertIn("rawset(t, \"definition\", def)", content)
+        self.assertIn("self:_loadArticleIntro(entry)", content)
+        self.assertIn('rawset(t, "definition", intro)', content)
+        self.assertIn('rawset(t, "images", images)', content)
         self.assertIn("__index = function(t, k)", content)
+
+        # Full article button wiring to open viewer
+        self.assertIn("lookup_window.lookupWikipedia", content)
+        self.assertIn("self:openEntry(entry, true)", content)
 
         # Offline Wikipedia button suppression inside its own window
         self.assertIn("not dict_popup.is_offline_wiki", content)
@@ -753,6 +758,58 @@ class TestWikipediaImageSupport(unittest.TestCase):
             self.assertIn("max-width: 48%", content)
             self.assertIn("figure.mw-halign-left", content)
             self.assertIn("figcaption, .thumbcaption", content)
+
+
+class TestWikipediaIntroAndInpageLookup(unittest.TestCase):
+    """Test the in-page lookup contract: intro extract, top-right image, and Full article button."""
+
+    def test_main_lua_has_intro_and_lead_image_methods(self):
+        with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        self.assertIn("function WikipediaZim:_findLeadImageSrc(html, article_url, z)", src)
+        self.assertIn("function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article_url)", src)
+        self.assertIn("function WikipediaZim:_extractIntroText(cleaned_html, raw_html)", src)
+        self.assertIn("function WikipediaZim:_loadArticleIntro(entry)", src)
+
+    def test_inpage_lookup_sets_is_html_false_and_is_wiki(self):
+        with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # In-page lookup item configuration
+        self.assertIn("is_html = false,", src)
+        self.assertIn("is_wiki = true,", src)
+        self.assertIn("is_wiki_fullpage = false,", src)
+
+    def test_full_article_button_wiring(self):
+        with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Custom lookupWikipedia override on DictQuickLookup instance
+        self.assertIn("lookup_window.lookupWikipedia = function(", src)
+        self.assertIn("lookup_self.results[lookup_self.dict_index]", src)
+        self.assertIn("lookup_self:onClose(true)", src)
+        self.assertIn("self:openEntry(entry, true)", src)
+
+    def test_lead_image_scaling_and_aspect_ratio(self):
+        with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        self.assertIn("RenderImage:renderImageData(data, #data)", src)
+        self.assertIn("bw > target_w", src)
+        self.assertIn("target_w * bh / bw", src)
+        self.assertIn("width = bw,", src)
+        self.assertIn("height = bh,", src)
+        self.assertIn("bb = bb,", src)
+
+    def test_intro_text_extract_format(self):
+        with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Cleans citations, footnotes, entities
+        self.assertIn("%[%s*%d+%s*%]", src)
+        self.assertIn("%[%s*citation needed%s*%]", src)
+        self.assertIn("(full article : %d kB)", src)
 
 
 if __name__ == "__main__":
