@@ -22,6 +22,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Device = require("device")
 local logger = require("logger")
 local _ = require("gettext")
+local ok_dict, DictQuickLookup = pcall(require, "ui/widget/dictquicklookup")
 
 local Library = require("library")
 local Viewer = require("viewer")
@@ -115,13 +116,14 @@ function WikipediaZim:addToHighlightDialog()
                     this:highlightFromHoldPos()
                 end
                 local raw_text = this.selected_text and this.selected_text.text
+                local boxes = this.selected_text and (this.selected_text.sboxes or this.selected_text.pboxes)
                 local ok_util, util = pcall(require, "util")
                 if ok_util and util and util.cleanupSelectedText and raw_text then
                     raw_text = util.cleanupSelectedText(raw_text)
                 end
                 this:onClose()
                 if raw_text and raw_text ~= "" then
-                    self:searchFromSelection(raw_text)
+                    self:searchFromSelection(raw_text, boxes)
                 end
             end,
         }
@@ -137,14 +139,18 @@ function WikipediaZim:registerDictButtons()
         can_shrink = true,
         pairs_with = "wikipedia",
         conditional = true,
+        show_func = function(dict_popup)
+            return not dict_popup.is_offline_wiki
+        end,
         callback = function(dict_popup)
             local word = dict_popup.lookupword or dict_popup.word
             if (not word or word == "") and dict_popup.highlight and dict_popup.highlight.selected_text then
                 word = dict_popup.highlight.selected_text.text
             end
+            local boxes = dict_popup.word_boxes
             dict_popup:onClose(true)
             if word and word ~= "" then
-                self:searchFromSelection(word)
+                self:searchFromSelection(word, boxes)
             end
         end,
     })
@@ -156,9 +162,24 @@ function WikipediaZim:hookWikipediaModule()
     self._wikipedia_hooked = true
     local orig_onLookupWikipedia = self.ui.wikipedia.onLookupWikipedia
     self.ui.wikipedia.onLookupWikipedia = function(wiki_self, word, is_sane, boxes, page, lang, dict_close_callback)
-        if G_reader_settings:isTrue("wikipediazim_prefer_offline") and self:_ensureScanned() then
+        if (G_reader_settings:isTrue("wikipediazim_prefer_offline") or page) and self:_ensureScanned() then
+            if page then
+                local cands = self:_getSearchCandidates(word)
+                for _, cand in ipairs(cands) do
+                    local hits = self.library:findExact("C", cand)
+                    if #hits > 0 then
+                        self:openEntry(hits[1], true)
+                        return true
+                    end
+                end
+                local prefix_hits = self.library:prefixSearch("C", query_to_url(word), 1)
+                if #prefix_hits > 0 then
+                    self:openEntry(prefix_hits[1], true)
+                    return true
+                end
+            end
             if dict_close_callback then dict_close_callback() end
-            self:searchFromSelection(word)
+            self:searchFromSelection(word, boxes, dict_close_callback)
             return true
         end
         return orig_onLookupWikipedia(wiki_self, word, is_sane, boxes, page, lang, dict_close_callback)
@@ -209,6 +230,10 @@ function WikipediaZim:_releaseAll()
     self.history = {}
     self.current_entry = nil
     self.current_html  = nil
+    if self.lookup_window then
+        UIManager:close(self.lookup_window)
+        self.lookup_window = nil
+    end
 end
 
 -- ---------- menu ----------
@@ -498,7 +523,7 @@ function WikipediaZim:openSearchDialog(initial_query, custom_title)
     dialog:onShowKeyboard()
 end
 
-function WikipediaZim:searchFromSelection(text)
+function WikipediaZim:searchFromSelection(text, boxes, dict_close_callback)
     if type(text) ~= "string" then return end
     local ok_util, util = pcall(require, "util")
     if ok_util and util and util.cleanupSelectedText then
@@ -513,10 +538,10 @@ function WikipediaZim:searchFromSelection(text)
     if text == "" then return end
 
     self.last_search = text
-    self:runSearch(text)
+    self:runSearch(text, boxes, dict_close_callback)
 end
 
-function WikipediaZim:runSearch(query)
+function WikipediaZim:runSearch(query, boxes, dict_close_callback)
     if not self:_ensureScanned() then
         UIManager:show(InfoMessage:new{
             text = string.format(_("No ZIM files in:\n%s"), self:_folder()),
@@ -536,7 +561,7 @@ function WikipediaZim:runSearch(query)
     local results = {}
     local seen_keys = {}
 
-    -- 1. Prefer exact title matches across all ZIMs
+    -- 1. Prefer exact title matches across all ZIMs (best match first)
     for _, cand in ipairs(candidates) do
         local exact_hits = self.library:findExact("C", cand)
         for _, hit in ipairs(exact_hits) do
@@ -563,13 +588,196 @@ function WikipediaZim:runSearch(query)
         end
     end
 
-    -- 3. If no results found, inform user and allow modifying query
+    -- 3. If no results found, show empty result in lookup window
     if #results == 0 then
-        self:openSearchDialog(query, string.format(_("No matches for “%s”. Modify search:"), query))
+        local dummy_results = {
+            {
+                dict = _("Wikipedia (offline)"),
+                word = query,
+                definition = string.format(_("No offline Wikipedia articles found for “%s”."), query),
+                is_html = false,
+                is_wiki = true,
+            }
+        }
+        self:showInLookupWindow(dummy_results, query, boxes, dict_close_callback)
         return
     end
 
-    self:showResultsMenu(results, query)
+    self:showInLookupWindow(results, query, boxes, dict_close_callback)
+end
+
+function WikipediaZim:_loadArticleHtml(entry)
+    local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
+    if not base then
+        return "<p><i>" .. _("Article not found.") .. "</i></p>"
+    end
+    local z, err = self.library:open(base)
+    if not z then
+        return "<p><i>" .. tostring(err or _("Failed to open ZIM.")) .. "</i></p>"
+    end
+    local resolved = z:resolveRedirect(entry)
+    if not resolved or resolved.kind ~= "article" then
+        return "<p><i>" .. _("Article not found.") .. "</i></p>"
+    end
+    local ok, html_or_err, mime = pcall(function() return z:readArticle(resolved) end)
+    if not ok or not html_or_err then
+        return "<p><i>" .. tostring(html_or_err or _("Failed to read article.")) .. "</i></p>"
+    end
+    if not mime or not mime:match("^text/html") then
+        return "<p><i>" .. _("Article is not HTML.") .. "</i></p>"
+    end
+    resolved._base = base
+    local cleaned = HtmlClean.clean(html_or_err)
+    if not cleaned or cleaned == "" then
+        cleaned = html_or_err
+    end
+    return cleaned
+end
+
+function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callback)
+    if not ok_dict or not DictQuickLookup then
+        self:showResultsMenu(results, query)
+        return
+    end
+
+    local multi = self.library:isMultiZim()
+    local dict_results = {}
+    local seen_targets = {}
+
+    for _i, entry in ipairs(results) do
+        local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
+        local target_key = (base or "") .. ":" .. (entry.url or "")
+        if not seen_targets[target_key] then
+            seen_targets[target_key] = true
+
+            local title = (entry.title and entry.title ~= "") and entry.title or (entry.url and entry.url:gsub("_", " ")) or query
+            title = title:gsub("_", " ")
+
+            local dict_name = _("Wikipedia (offline)")
+            if multi then
+                local short = (base or ""):match("^([^_%.]+)") or base or ""
+                dict_name = string.format(_("Wikipedia (%s)"), short:sub(1, 10))
+            end
+
+            local item = {
+                dict = dict_name,
+                word = title,
+                is_html = (entry.is_html ~= false),
+                is_wiki = true,
+                is_wiki_fullpage = false,
+                zim_entry = entry,
+            }
+
+            if entry.definition then
+                item.definition = entry.definition
+            elseif #dict_results == 0 then
+                -- Preload definition for the first (best match) result immediately
+                item.definition = self:_loadArticleHtml(entry)
+            else
+                -- Lazy load definition for other matching articles on demand
+                setmetatable(item, {
+                    __index = function(t, k)
+                        if k == "definition" then
+                            local def = self:_loadArticleHtml(entry)
+                            rawset(t, "definition", def)
+                            return def
+                        end
+                        return nil
+                    end,
+                })
+            end
+
+            table.insert(dict_results, item)
+        end
+    end
+
+    if #dict_results == 0 then
+        table.insert(dict_results, {
+            dict = _("Wikipedia (offline)"),
+            word = query,
+            definition = string.format(_("No offline Wikipedia articles found for “%s”."), query),
+            is_html = false,
+            is_wiki = true,
+        })
+    end
+
+    local ui = self.ui
+    if not ui then
+        ui = {}
+    end
+    if not ui.wikipedia then
+        ui.wikipedia = {
+            getWikiLanguages = function()
+                return { "en" }, "en"
+            end,
+            setLastSelectedLanguage = function() end,
+        }
+    end
+    if not ui.dictionary then
+        ui.dictionary = {
+            default_layout = {
+                { "prev_dict", "highlight", "next_dict" },
+                { "wikipedia", "search", "close" },
+            },
+            _dict_buttons = {},
+            addToDictButtons = function() end,
+        }
+    end
+
+    local lookup_window
+    lookup_window = DictQuickLookup:new{
+        ui = ui,
+        highlight = self.ui and self.ui.highlight,
+        word = query,
+        results = dict_results,
+        word_boxes = boxes,
+        is_wiki = true,
+        is_wiki_fullpage = false,
+        is_offline_wiki = true,
+        refresh_callback = function()
+            if self.ui and self.ui.view and self.ui.view.footer then
+                self.ui.view.footer:onUpdateFooter()
+            end
+        end,
+        html_dictionary_link_tapped_callback = function(dictionary, link)
+            self:onHtmlDictionaryLinkTapped(dictionary, link)
+        end,
+        dict_close_callback = dict_close_callback,
+    }
+    self.lookup_window = lookup_window
+    UIManager:show(lookup_window)
+end
+
+function WikipediaZim:onHtmlDictionaryLinkTapped(dictionary, link)
+    local href = type(link) == "table" and (link.uri or link.url) or link
+    if not href or href == "" then return end
+    local hash = href:find("#", 1, true)
+    if hash then href = href:sub(1, hash - 1) end
+    if href == "" then return end
+    href = href:gsub("^%./", ""):gsub("^/A/", ""):gsub("^A/", "")
+    href = href:gsub("%.html?$", "")
+    if href:match("^https?://") or href:match("^mailto:") then
+        UIManager:show(InfoMessage:new{
+            text = _("External link (offline):\n") .. href, timeout = 2,
+        })
+        return
+    end
+    local target = url_decode(href)
+    local link_boxes
+    if type(link) == "table" and link.x0 and link.y0 then
+        local ok_geom, Geom = pcall(require, "ui/geometry")
+        if ok_geom and Geom then
+            link_boxes = {
+                Geom:new{
+                    x = link.x0,
+                    y = link.y0,
+                    w = math.abs((link.x1 or link.x0) - link.x0),
+                    h = math.abs((link.y1 or link.y0) - link.y0),
+                }
+            }
+        end
+    end
+    self:searchFromSelection(target, link_boxes)
 end
 
 function WikipediaZim:showResultsMenu(results, query)

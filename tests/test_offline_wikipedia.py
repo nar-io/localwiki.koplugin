@@ -599,9 +599,35 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
         self.assertIn("onReaderReady", content)
 
         # Public interface
-        self.assertIn("function WikipediaZim:searchFromSelection(text)", content)
+        self.assertIn("function WikipediaZim:searchFromSelection(", content)
         self.assertIn("function WikipediaZim:onSearchOfflineWikipedia(text)", content)
         self.assertIn("function WikipediaZim:_getSearchCandidates(query)", content)
+        self.assertIn("function WikipediaZim:showInLookupWindow(", content)
+        self.assertIn("function WikipediaZim:_loadArticleHtml(entry)", content)
+        self.assertIn("function WikipediaZim:onHtmlDictionaryLinkTapped(", content)
+
+    def test_lookup_window_contract(self):
+        """Verify that searches open in KOReader's DictQuickLookup widget matching online Wikipedia."""
+        with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # DictQuickLookup integration
+        self.assertIn('"ui/widget/dictquicklookup"', content)
+        self.assertIn("DictQuickLookup:new", content)
+        self.assertIn("is_wiki = true", content)
+        self.assertIn("is_offline_wiki = true", content)
+
+        # Best match first + Lazy loading metatable pattern for remaining results
+        self.assertIn("item.definition = self:_loadArticleHtml(entry)", content)
+        self.assertIn("rawset(t, \"definition\", def)", content)
+        self.assertIn("__index = function(t, k)", content)
+
+        # Offline Wikipedia button suppression inside its own window
+        self.assertIn("not dict_popup.is_offline_wiki", content)
+
+        # Internal link navigation callback
+        self.assertIn("html_dictionary_link_tapped_callback", content)
+        self.assertIn("self:onHtmlDictionaryLinkTapped", content)
 
     def test_zim_lua_has_find_exact(self):
         with open(os.path.join(PLUGIN_DIR, "zim.lua"), "r", encoding="utf-8") as f:
