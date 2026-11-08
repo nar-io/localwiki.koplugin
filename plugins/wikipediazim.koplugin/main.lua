@@ -1497,9 +1497,21 @@ function WikipediaZim:_embedImagesInHtml(z, html, article_url)
     local BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
     local show_image = G_reader_settings:nilOrTrue("wikipedia_show_image")
     if not show_image then
-        -- Fast path: blank all image sources if image display is disabled
-        return html:gsub('(<img%s+[^>]-src=")[^"]*(")', "%1" .. BLANK_GIF .. "%2")
-                   :gsub("(<img%s+[^>]-src=')[^']*(')", "%1" .. BLANK_GIF .. "%2")
+        -- Image display disabled: nothing to extract. Blank the sources with a
+        -- single tag walk instead of two whole-document gsubs, and skip the
+        -- caption/lead-image passes below entirely.
+        if not html:find("<img", 1, true) then return html end
+        return (html:gsub('<img[^>]*>', function(tag)
+            -- Match the src value with a plain scan rather than a pattern:
+            -- image paths can contain quotes, which would break a lazy %2 match.
+            local s = tag:find("src=", 1, true)
+            if not s then return tag end
+            local q = tag:sub(s + 4, s + 4)
+            if q ~= '"' and q ~= "'" then return tag end
+            local e = tag:find(q, s + 5, true)
+            if not e then return tag end
+            return tag:sub(1, s + 3) .. q .. BLANK_GIF .. tag:sub(e)
+        end))
     end
 
     local max_images = 6
