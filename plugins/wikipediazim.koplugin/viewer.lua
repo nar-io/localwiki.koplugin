@@ -153,9 +153,43 @@ local function makeCss(face, spacing, margin_em)
             display: none;
         }
 
-        /* Mobile Wikipedia Infobox Card */
+        /* Infobox normalised by htmlclean.lua: a plain two-column table. */
         table.infobox {
-            border: 1px solid #a2a9b1 !important;
+            border-collapse: collapse !important;
+            width: 100%% !important;
+            margin: 0.6em 0 1.0em;
+            font-size: 88%%;
+            line-height: 1.35;
+        }
+        table.infobox td, table.infobox th {
+            border: 1px solid #eaecf0;
+            padding: 0.22em 0.4em;
+            vertical-align: top;
+            text-align: left;
+            word-break: break-word;
+        }
+        table.infobox th.wz-ib-heading {
+            background-color: #eaecf0;
+            text-align: center;
+            font-size: 112%%;
+        }
+        table.infobox th.wz-ib-label {
+            background-color: #f0f2f5;
+            font-weight: bold;
+            width: 34%%;
+        }
+        table.infobox td.wz-ib-images {
+            text-align: center;
+        }
+        table.infobox td.wz-ib-images img {
+            max-width: 30%%;
+            height: auto;
+            margin: 0.1em;
+            vertical-align: middle;
+        }
+
+        /* Mobile Wikipedia Infobox Card */
+        table.infobox {            border: 1px solid #a2a9b1 !important;
             border-spacing: 0 !important;
             border-collapse: collapse !important;
             background-color: #f8f9fa !important;

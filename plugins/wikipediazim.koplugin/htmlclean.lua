@@ -65,6 +65,173 @@ local function strip_balanced_if(html, start_pat, nest_open, close_str, probe)
     return strip_balanced(html, start_pat, nest_open, close_str)
 end
 
+-- ── Infobox normalisation ────────────────────────────────────────────────────
+
+-- Find the end of the block opened by `open_tag` at `start`, counting nested
+-- tags of the same name. Returns the index just past the matching close tag.
+local function find_block_end(html, start, name)
+    local open_pat = "<" .. name
+    local close_str = "</" .. name .. ">"
+    local gt = html:find(">", start, true)
+    if not gt then return nil end
+    local depth, i = 1, gt + 1
+    while depth > 0 do
+        local oo = html:find(open_pat, i, true)
+        local cc = html:find(close_str, i, true)
+        if not cc then return nil end
+        if oo and oo < cc then
+            depth = depth + 1
+            i = oo + #open_pat
+        else
+            depth = depth - 1
+            i = cc + #close_str
+        end
+    end
+    return i
+end
+
+-- Remove nested tables from a cell and flatten its markup to plain text.
+-- `sep` is what a <br> becomes (a line break inside a cell is meaningful).
+local function cell_text(fragment, sep)
+    sep = sep or " "
+    local guard = 0
+    while fragment:find("<table", 1, true) and guard < 20 do
+        local s = fragment:find("<table", 1, true)
+        local e = find_block_end(fragment, s, "table")
+        if not e then break end
+        fragment = fragment:sub(1, s - 1) .. fragment:sub(e)
+        guard = guard + 1
+    end
+    fragment = fragment:gsub("<img[^>]*>", "")
+    fragment = fragment:gsub("</?span[^>]*>", "")
+    fragment = fragment:gsub("</?div[^>]*>", " ")
+    fragment = fragment:gsub("</?small[^>]*>", "")
+    fragment = fragment:gsub("</?b>", "")
+    fragment = fragment:gsub("</?i>", "")
+    fragment = fragment:gsub("</?a[^>]*>", "")
+    fragment = fragment:gsub("<br%s*/?>", sep)
+    fragment = fragment:gsub("<[^>]+>", "")
+    fragment = fragment:gsub("&#160;", " "):gsub("&nbsp;", " ")
+    fragment = fragment:gsub("&amp;", "&"):gsub("&quot;", '"'):gsub("&#39;", "'")
+    fragment = fragment:gsub("[ \t]+", " ")
+    fragment = fragment:gsub(" *\n *", "\n")
+    fragment = fragment:gsub("\n+", sep)
+    fragment = fragment:match("^%s*(.-)%s*$") or ""
+    fragment = fragment:gsub("^[%s·]+", ""):gsub("[%s·]+$", "")
+    return fragment
+end
+
+-- Rebuild the first infobox as a simple two-column table that MuPDF can lay
+-- out: one <tr> per label/value pair, full-width rows for headings and
+-- images. Wikipedia's original box nests tables several levels deep, which
+-- MuPDF renders with overlapping text.
+local function normalize_infobox(html)
+    local s = html:find('<table%s+[^>]-class="[^"]-infobox')
+    if not s then return html end
+    local e = find_block_end(html, s, "table")
+    if not e then return html end
+    local box = html:sub(s, e - 1)
+
+    local out = { '<table class="infobox">' }
+    local images = {}
+    local rows, pairs = 0, 0
+    local pos = 1
+    while true do
+        local rs = box:find("<tr", pos, true)
+        if not rs then break end
+        local re = find_block_end(box, rs, "tr")
+        if not re then break end
+        local row = box:sub(rs, re - 1)
+        pos = re
+        rows = rows + 1
+
+        for img in row:gmatch("<img[^>]*>") do
+            images[#images + 1] = img
+        end
+
+        local is_heading = row:find("infobox%-above") or row:find("infobox%-title")
+            or row:find("infobox%-subheader")
+
+        -- Collect every cell in the row (battle boxes use one column per side).
+        local cells = {}
+        local cp = 1
+        while true do
+            local cs = row:find("<t[dh]", cp)
+            if not cs then break end
+            local is_th = row:sub(cs + 1, cs + 2) == "th"
+            local ce = find_block_end(row, cs, is_th and "th" or "td")
+            if not ce then break end
+            local tag = row:sub(cs, row:find(">", cs, true))
+            local colspan = tonumber(tag:match('colspan="(%d+)"') or tag:match("colspan='(%d+)'") or 1) or 1
+            cells[#cells + 1] = {
+                is_th = is_th,
+                colspan = colspan,
+                text = cell_text(row:sub(cs, ce - 1), "\n"),
+            }
+            cp = ce
+        end
+
+        local function emit_row(html_row)
+            out[#out + 1] = html_row
+        end
+
+        if is_heading then
+            local text = cell_text(row)
+            if text ~= "" then
+                emit_row('<tr><th colspan="2" class="wz-ib-heading">' .. text .. '</th></tr>')
+            end
+        elseif #cells >= 2 and cells[1].is_th then
+            -- Label + one or more values: keep the label in the left column and
+            -- the values in the right one, separated by a line break.
+            local vals = {}
+            for k = 2, #cells do
+                if cells[k].text ~= "" then vals[#vals + 1] = cells[k].text end
+            end
+            if cells[1].text ~= "" and #vals > 0 then
+                emit_row('<tr><th class="wz-ib-label">' .. cells[1].text ..
+                    '</th><td class="wz-ib-value">' .. table.concat(vals, "\n") .. '</td></tr>')
+                pairs = pairs + 1
+            elseif #vals > 0 then
+                emit_row('<tr><td colspan="2" class="wz-ib-value">' ..
+                    table.concat(vals, "\n") .. '</td></tr>')
+            end
+        elseif #cells >= 2 then
+            -- Side-by-side values without a label (battle "Taraflar",
+            -- "Komutanlar", "Güçler"): one column per side, exactly like the
+            -- original table.
+            local cols = {}
+            for k = 1, #cells do
+                if cells[k].text ~= "" then cols[#cols + 1] = cells[k].text end
+            end
+            if #cols > 0 then
+                local width = math.floor(100 / #cols)
+                local tds = {}
+                for k, v in ipairs(cols) do
+                    tds[#tds + 1] = string.format('<td class="wz-ib-value" style="width: %d%% !important">%s</td>',
+                        width, v)
+                end
+                emit_row("<tr>" .. table.concat(tds) .. "</tr>")
+                pairs = pairs + 1
+            end
+        else
+            local text = cells[1] and cells[1].text or cell_text(row)
+            if text ~= "" then
+                emit_row('<tr><td colspan="2" class="wz-ib-value">' .. text .. '</td></tr>')
+            end
+        end
+    end
+    if #images > 0 then
+        table.insert(out, 2, '<tr><td colspan="2" class="wz-ib-images">' ..
+            table.concat(images) .. '</td></tr>')
+    end
+    out[#out + 1] = '</table>'
+
+    if rows == 0 or pairs == 0 then
+        return html:sub(1, s - 1) .. html:sub(e)
+    end
+    return html:sub(1, s - 1) .. table.concat(out) .. html:sub(e)
+end
+
 -- Remove every <tag … class="… name …">…</tag> block (nested same-tag
 -- children included) in a single pass over the document.
 --
@@ -305,6 +472,14 @@ function M.clean(html, is_full_page, page_title, opts)
         end
         if html:find("noviewer", 1, true) then
             html = html:gsub('<span%s+[^>]-class="[^"]-noviewer[^"]-"[^>]*>.-</span>', "")
+        end
+
+        -- Infobox: MuPDF's HTML engine lays out the deeply nested tables
+        -- Wikipedia uses for infoboxes badly (labels and values overlap,
+        -- image grids collapse). Rebuild the box as a simple two-column table
+        -- before MuPDF ever sees it.
+        if html:find("infobox", 1, true) then
+            html = normalize_infobox(html)
         end
 
         if header_html then

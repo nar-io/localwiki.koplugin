@@ -18,7 +18,8 @@ plugins/wikipediazim.koplugin/
   htmlclean.lua     strips Vector skin chrome, infobox/navbox tables,
                     hatnotes, embedded <style> and (by default) the
                     reference list — drops ~30–60% of HTML weight so
-                    MuPDF only renders the prose
+                    MuPDF only renders the prose; rebuilds the infobox as a
+                    simple two-column table MuPDF can lay out
   viewer.lua        full-screen ScrollHtmlWidget with link taps + A−/A+
                     font-size cycle
 split_zim.py        Desktop-side helper: splits a >4 GB ZIM into FAT32-safe parts
@@ -128,6 +129,8 @@ The ZIM file handle is opened **once per KOReader session** (lazily, on first ar
 | Cluster cache hit | <5 ms | Linked articles in same cluster (~200 articles each) |
 
 Measured on a Kindle PaperWhite 5 with KOReader v2026.07.1 against real Turkish Wikipedia articles, clean + parse/layout: `Fizik` 116 KB raw → 0.12 s + 0.16 s, 23 pages; `Ankara` 442 KB → 0.56 s + 0.66 s, 20 pages; `İstanbul` 1.0 MB → 1.20 s + 0.65 s, 48 pages; `Mustafa Kemal Atatürk` 1.1 MB → 1.37 s + 0.89 s, 70 pages. These figures use the default reference stripping; toggling **Show references (slower)** keeps the reference list and the in-text markers (e.g. Atatürk: 92 pages, 1.47 s clean + 1.43 s parse/layout).
+
+Infoboxes are rebuilt as a simple two-column table before MuPDF sees them. Wikipedia nests tables several levels deep, which MuPDF renders with overlapping text; the rebuilt table keeps labels in the left column and values (or, for battle articles, one column per belligerent) on the right. This does not change the speed figures above by more than measurement noise.
 
 If a load still feels slow, check `koreader.log`. The most common culprit is a very long article (e.g. "List of …" pages, ~500 KB even after cleaning) — those just take time on the device CPU.
 
