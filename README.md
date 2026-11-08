@@ -101,7 +101,7 @@ From **Tools → More tools → Wikipedia (offline)**:
 - **Search articles** — type a title prefix (e.g. `Albert E`). Capitalisation and spaces are normalised; matches scroll alphabetically. With one ZIM in the folder, results show plain titles. With multiple ZIMs, each result is tagged `[base]` so you can see which library it came from. Tap a result to open it; the article's owning ZIM is opened on demand the first time it's needed and cached after that.
 - **Open main page** — opens the front page of the first ZIM.
 - **Loaded ZIMs…** — diagnostic view: lists what was discovered, how many parts make up each logical ZIM, and which are currently open.
-- **Show references (slower)** — off by default. The reference list at the end of an article is often 30–40% of the cleaned HTML and adds dozens of MuPDF pages, so it is stripped for reading. Enable this to keep it.
+- **Show references (slower)** — off by default. With it off, the reference list at the end of an article **and** the in-text `[1]`-style citation markers are removed (they are dead links without the list, and they account for 30–55% of the cleaned HTML). With it on, both are kept.
 
 Inside an article:
 
@@ -123,11 +123,11 @@ The ZIM file handle is opened **once per KOReader session** (lazily, on first ar
 | Open ZIM (first time) | <50 ms | Reads 80-byte header + MIME list. Splitfile opens N FDs. |
 | Title search | ~30–60 ms | ~24 disk seeks for binary search through 19 M entries |
 | Cluster fetch + decompress | ~50–200 ms | ~2 MB compressed → libzstd via FFI |
-| HTML clean | 0.09–1.3 s | Strips chrome/infoboxes/styles and, by default, the reference list → ~45–66% of the raw HTML size |
-| MuPDF parse + layout | 0.16–1.1 s | Dominant cost on Kindle CPU; 21–71 pages depending on article length |
+| HTML clean | 0.09–1.4 s | Strips chrome/infoboxes/styles and, by default, the reference list and its in-text markers → ~35–66% of the raw HTML size |
+| MuPDF parse + layout | 0.16–0.9 s | Dominant cost on Kindle CPU; 20–70 pages depending on article length |
 | Cluster cache hit | <5 ms | Linked articles in same cluster (~200 articles each) |
 
-Measured on a Kindle PaperWhite 5 with KOReader v2026.07.1 against real Turkish Wikipedia articles, clean + parse/layout: `Fizik` 116 KB raw → 0.09 s + 0.16 s, 23 pages; `Ankara` 442 KB → 0.44 s + 0.69 s, 21 pages; `İstanbul` 1.0 MB → 1.11 s + 0.77 s, 48 pages; `Mustafa Kemal Atatürk` 1.1 MB → 1.31 s + 1.09 s, 71 pages. Before the cleaner rewrite the same articles took 0.25–3.0 s to clean and produced 24–92 pages. These figures use the default reference stripping; toggling **Show references (slower)** keeps the reference list (e.g. Atatürk: 92 pages, 1.48 s clean).
+Measured on a Kindle PaperWhite 5 with KOReader v2026.07.1 against real Turkish Wikipedia articles, clean + parse/layout: `Fizik` 116 KB raw → 0.12 s + 0.16 s, 23 pages; `Ankara` 442 KB → 0.56 s + 0.66 s, 20 pages; `İstanbul` 1.0 MB → 1.20 s + 0.65 s, 48 pages; `Mustafa Kemal Atatürk` 1.1 MB → 1.37 s + 0.89 s, 70 pages. These figures use the default reference stripping; toggling **Show references (slower)** keeps the reference list and the in-text markers (e.g. Atatürk: 92 pages, 1.47 s clean + 1.43 s parse/layout).
 
 If a load still feels slow, check `koreader.log`. The most common culprit is a very long article (e.g. "List of …" pages, ~500 KB even after cleaning) — those just take time on the device CPU.
 
