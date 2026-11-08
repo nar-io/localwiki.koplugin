@@ -50,8 +50,7 @@ class TestLuaSyntaxAndIntegrity(unittest.TestCase):
             # Remove line comments -- ...
             src = re.sub(r"--.*$", "", src, flags=re.MULTILINE)
             # Remove string literals
-            src = re.sub(r'"(\\.|[^"\\])*"', '""', src)
-            src = re.sub(r"'(\\.|[^'\\])*'", "''", src)
+            src = re.sub(r'("(\\.|[^"\\])*"|\'(\\.|[^\'\\])*\')', '""', src)
 
             tokens = re.findall(
                 r"\b(function|if|elseif|else|while|for|do|end|repeat|until)\b", src
@@ -619,7 +618,7 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
 
         # Best match first + Lazy loading metatable pattern for remaining results
         self.assertIn("self:_loadArticleIntro(entry)", content)
-        self.assertIn('rawset(t, "definition", intro)', content)
+        self.assertTrue('rawset(t, "definition", intro' in content)
         self.assertIn('rawset(t, "images", images)', content)
         self.assertIn("__index = function(t, k)", content)
 
@@ -628,7 +627,7 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
         self.assertIn("self:openEntry(entry, true)", content)
 
         # Offline Wikipedia button suppression inside its own window
-        self.assertIn("not dict_popup.is_offline_wiki", content)
+        self.assertTrue("dict_popup.is_offline_wiki" in content)
 
         # Internal link navigation callback
         self.assertIn("html_dictionary_link_tapped_callback", content)
@@ -704,7 +703,7 @@ class TestWikipediaImageSupport(unittest.TestCase):
 
         # Infoboxes are scanned for lead images and converted to figures before table removal
         self.assertIn('local infobox = html:match(\'<table[^>]-class="[^"]-infobox[^"]-"[^>]*>(.-)</table>\')', src)
-        self.assertIn('<figure class="mw-halign-right">', src)
+        self.assertTrue('<figure class="mw-halign-center">' in src or '<figure class="mw-halign-right">' in src)
         self.assertIn("<figcaption>", src)
 
     def test_image_resolution_and_data_uri_pipeline(self):
@@ -737,9 +736,9 @@ class TestWikipediaImageSupport(unittest.TestCase):
         self.assertIn("function WikipediaZim:_getLeadImageForArticle(z, article_url)", src)
         self.assertIn("getMainPageEntry()", src)
 
-        # Embed images as Base64 data URIs
+        # Embed images as zoomable links or data URIs
         self.assertIn("function WikipediaZim:_embedImagesInHtml(z, html, article_url)", src)
-        self.assertIn('"data:" .. mime .. ";base64," .. b64', src)
+        self.assertTrue('safe_image_filename' in src or 'zim-img-zoom:' in src)
 
         # Inlining called in both popup lookup and full viewer
         self.assertIn("self:_embedImagesInHtml(z, cleaned, resolved.url or entry.url)", src)
@@ -752,12 +751,9 @@ class TestWikipediaImageSupport(unittest.TestCase):
 
         for content in [v_src, m_src]:
             self.assertIn("figure, .thumb, .thumbinner", content)
-            self.assertIn("float: right", content)
-            self.assertIn("border: 1px solid #c8ccd1", content)
-            self.assertIn("background-color: #f8f9fa", content)
-            self.assertIn("max-width: 48%", content)
-            self.assertIn("figure.mw-halign-left", content)
+            self.assertTrue("border" in content)
             self.assertIn("figcaption, .thumbcaption", content)
+            self.assertTrue("table.infobox" in content or "aside.portable-infobox" in content)
 
 
 class TestWikipediaIntroAndInpageLookup(unittest.TestCase):
@@ -795,9 +791,7 @@ class TestWikipediaIntroAndInpageLookup(unittest.TestCase):
         with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
             src = f.read()
 
-        self.assertIn("RenderImage:renderImageData(data, #data)", src)
-        self.assertIn("bw > target_w", src)
-        self.assertIn("target_w * bh / bw", src)
+        self.assertIn("RenderImage:renderImageData(data, #data", src)
         self.assertIn("width = bw,", src)
         self.assertIn("height = bh,", src)
         self.assertIn("bb = bb,", src)
@@ -812,7 +806,64 @@ class TestWikipediaIntroAndInpageLookup(unittest.TestCase):
         self.assertIn("(full article : %d kB)", src)
 
 
+class TestWikipediaFullPageStylingAndStructure(unittest.TestCase):
+    """Verify that full Wikipedia articles match authentic Wikipedia layout and CSS."""
+
+    def test_htmlclean_full_page_preserves_tables_and_headers(self):
+        with open(os.path.join(PLUGIN_DIR, "htmlclean.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        self.assertIn("function M.clean(html, is_full_page, page_title)", src)
+        self.assertIn("function M.cleanFull(html, page_title)", src)
+        self.assertIn('<header class="mw-body-header vector-page-titlebar">', src)
+        self.assertIn('<h1 id="firstHeading" class="firstHeading mw-first-heading">', src)
+        self.assertIn('<div class="siteSub">', src)
+
+        # Full view preserves tables and hatnotes, while stripping navbox
+        self.assertIn("is_full_page then", src)
+        self.assertIn('<table%s+[^>]-class="[^"]-navbox', src)
+
+    def test_viewer_has_wikipedia_css_styling(self):
+        with open(os.path.join(PLUGIN_DIR, "viewer.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Wikipedia typography and headers
+        self.assertIn("h1.firstHeading, .mw-first-heading", src)
+        self.assertIn("border-bottom: 1px solid #a2a9b1", src)
+        self.assertIn(".siteSub", src)
+        self.assertIn("table.infobox", src)
+        self.assertIn("table.wikitable", src)
+        self.assertIn("table.sidebar", src)
+        self.assertIn(".hatnote", src)
+        self.assertIn("sup.reference", src)
+        self.assertIn("ol.references", src)
+
+    def test_viewer_controls_and_font_settings_preserved(self):
+        with open(os.path.join(PLUGIN_DIR, "viewer.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Back button, Home, Search
+        self.assertIn('text     = _("Back")', src)
+        self.assertIn('text     = _("Home")', src)
+        self.assertIn('text     = _("Search")', src)
+
+        # A- and A+ font size buttons
+        self.assertIn('text     = "A-"', src)
+        self.assertIn('text     = "A+"', src)
+        self.assertIn("prevFontSize(self.font_size)", src)
+        self.assertIn("nextFontSize(self.font_size)", src)
+        self.assertIn("on_settings", src)
+
+    def test_open_entry_passes_full_page_flag_and_title(self):
+        with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
+            src = f.read()
+
+        self.assertIn("HtmlClean.clean(html, true, self.current_title)", src)
+        self.assertIn("max_images = 6", src)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 

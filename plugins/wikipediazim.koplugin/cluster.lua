@@ -11,7 +11,7 @@ clusters — that turns a hot reading session into pure memcpy after the first h
 local ffi = require("ffi")
 local logger = require("logger")
 
-ffi.cdef[[
+pcall(ffi.cdef, [[
 /* libzstd — one-shot decompression API, plenty for our cluster sizes */
 size_t ZSTD_decompress(void* dst, size_t dstCap, const void* src, size_t srcSize);
 unsigned long long ZSTD_getFrameContentSize(const void* src, size_t srcSize);
@@ -32,7 +32,7 @@ lzma_ret lzma_stream_buffer_decode(
     uint64_t *memlimit, uint32_t flags, void *allocator,
     const uint8_t *in, size_t *in_pos, size_t in_size,
     uint8_t *out, size_t *out_pos, size_t out_size);
-]]
+]])
 
 local function try_load(names)
     for _, n in ipairs(names) do
@@ -85,16 +85,27 @@ end
 local UNKNOWN_SIZE = 0xFFFFFFFFFFFFFFFFULL  -- ZSTD_CONTENTSIZE_UNKNOWN
 local ERROR_SIZE   = 0xFFFFFFFFFFFFFFFEULL  -- ZSTD_CONTENTSIZE_ERROR
 
+-- Reusable static buffer to prevent repetitive 1-2 MB allocations on the LuaJIT GC heap.
+local cached_decomp_buf = nil
+local cached_decomp_cap = 0
+local function get_decomp_buf(size)
+    if not cached_decomp_buf or cached_decomp_cap < size then
+        cached_decomp_cap = math.max(size, 2 * 1024 * 1024)
+        cached_decomp_buf = ffi.new("uint8_t[?]", cached_decomp_cap)
+    end
+    return cached_decomp_buf
+end
+
 local function decompress_zstd(data)
     if not zstd then error("libzstd not available — cannot read this ZIM") end
     local src = ffi.cast("const char*", data)
     local src_size = #data
     local frame_size = zstd.ZSTD_getFrameContentSize(src, src_size)
 
-    -- Fast path: known content size, single allocation, single call.
+    -- Fast path: known content size, single call into reusable C buffer.
     if frame_size ~= UNKNOWN_SIZE and frame_size ~= ERROR_SIZE then
         local size = tonumber(frame_size)
-        local dst = ffi.new("uint8_t[?]", size)
+        local dst = get_decomp_buf(size)
         local r = zstd.ZSTD_decompress(dst, size, src, src_size)
         if zstd.ZSTD_isError(r) ~= 0 then
             error("zstd decompress: " .. ffi.string(zstd.ZSTD_getErrorName(r)))

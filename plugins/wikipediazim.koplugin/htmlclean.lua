@@ -7,20 +7,17 @@ parses every byte of that, so cutting it down is the single biggest perf
 win we can do.
 
 What this function does:
-  1. Crops to the first <div class="mw-parser-output"> — the actual article
-     body. Header chrome, page titlebars, footers all get dropped.
-  2. Removes elements that don't nest in real HTML via regex:
-        <style>, <script>, <noscript>, <svg>, <img>, <picture>, <figure>,
+  1. In full page mode, retains original Wikipedia structure with a mobile card layout:
+     - Infoboxes and sidebars as clean centered cards (float:none) to eliminate text wrap bugs.
+     - Strips heavy navbox tables, footers, metadata and banners.
+     - Strips layout-breaking inline CSS (hardcoded widths, floats, positions).
+  2. In lookup mode (short extracts), crops and strips tables to save RAM.
+  3. Removes elements that don't nest in real HTML via regex with fast probe guards:
+        <style>, <script>, <noscript>, <svg>, <picture>,
         <audio>, <video>, <link>, <meta>
-  3. Removes elements that DO nest via balanced tag matching:
-        <table> (infoboxes, navboxes — drop ALL tables; on a 6" screen
-                 they always render as walls of text)
-        <div class="hatnote …"> (the "For the cat family, see Felidae"
-                                 disambig blurbs)
   4. Removes empty <p class="mw-empty-elt"> placeholders.
 
-Returns the cleaned HTML body (you wrap it with whatever <html>/<body>
-shell your renderer wants).
+Returns the cleaned HTML body.
 ]]
 
 local M = {}
@@ -62,8 +59,148 @@ local function strip_balanced(html, start_pat, nest_open, close_str)
     end
 end
 
-function M.clean(html)
+-- Fast-path conditional wrapper: skips expensive scanning when probe string is absent
+local function strip_balanced_if(html, start_pat, nest_open, close_str, probe)
+    if probe and not html:find(probe, 1, true) then return html end
+    return strip_balanced(html, start_pat, nest_open, close_str)
+end
+
+-- Remove every <tag … class="… name …">…</tag> block (nested same-tag
+-- children included) in a single pass over the document.
+--
+-- `classes` maps a class name to true (strip it) or false (keep it).
+--
+-- The pre-refactor code ran one strip pass per class over the whole document
+-- (13 passes for a full page), even when the class never appeared: on a 1 MB
+-- article that was ~1 s of scanning and ~13 copies of the document. Here the
+-- document is scanned once for `class="`; each match is resolved to its
+-- enclosing tag, and only matching blocks are cut out. Output is identical
+-- to the old pass sequence (verified against the pre-refactor implementation).
+--
+-- A kept block is copied out verbatim, so the scan never restarts inside it.
+local BLOCK_TAGS = { table = true, div = true, ol = true, ul = true }
+
+-- Find the <tag …> that encloses position `c` (a `class="` occurrence),
+-- walking back through nested tags. Returns tag_start, tag_name, gt (index
+-- of the closing ">"), or nil when the position is not inside a tag.
+--
+-- The walk back is byte-by-byte and bounded: `html:sub(1, c-1):match(".*()<")`
+-- copies the whole prefix on every call, which made this O(n²) on articles
+-- with thousands of class attributes (3.3 s for 2000 lookups on Ankara).
+local LOOKBACK_LIMIT = 2048
+local function enclosing_tag(html, c)
+    local lt = c - 1
+    local limit = c - LOOKBACK_LIMIT
+    if limit < 1 then limit = 1 end
+    while lt >= limit do
+        if html:byte(lt) == 60 then -- '<'
+            local tag_name = html:match("^<(%a+)", lt)
+            local gt = html:find(">", lt, true)
+            if tag_name and gt and gt > c then
+                return lt, tag_name, gt
+            end
+        end
+        lt = lt - 1
+    end
+    return nil
+end
+
+-- Find the matching close tag for a block opened at `tag_start` whose opening
+-- tag ends at `gt`. Returns the index just past the close tag.
+local function block_end(html, tag_start, name, gt)
+    local close_str = "</" .. name .. ">"
+    local nest_open = "<" .. name
+    local nest_len, close_len = #nest_open, #close_str
+    local depth, i = 1, gt + 1
+    while depth > 0 do
+        local oo = html:find(nest_open, i, true)
+        local cc = html:find(close_str, i, true)
+        if not cc then
+            -- Malformed input: keep the rest untouched.
+            return nil
+        end
+        if oo and oo < cc then
+            depth = depth + 1
+            i = oo + nest_len
+        else
+            depth = depth - 1
+            i = cc + close_len
+        end
+    end
+    return i
+end
+
+local function strip_class_blocks(html, classes)
+    local out, pos = {}, 1
+    while true do
+        local c = html:find('class="', pos, true)
+        if not c then
+            out[#out + 1] = html:sub(pos)
+            break
+        end
+        local tag_start, tag_name, gt = enclosing_tag(html, c)
+        local name = tag_name and tag_name:lower()
+        local strip = false
+        if name and BLOCK_TAGS[name] then
+            -- Only the first class token: the attribute value ends at the
+            -- closing quote, not at the end of the tag.
+            local first_word = html:sub(c + 7):match("^[^%s\"]*")
+            local wanted = classes[first_word]
+            if wanted ~= nil then
+                strip = wanted
+            end
+        end
+        if not strip then
+            out[#out + 1] = html:sub(pos, c + 6)
+            pos = c + 7
+        else
+            local next_pos = block_end(html, tag_start, name, gt)
+            if not next_pos then
+                out[#out + 1] = html:sub(pos)
+                break
+            end
+            out[#out + 1] = html:sub(pos, tag_start - 1)
+            pos = next_pos
+        end
+    end
+    return table.concat(out)
+end
+
+function M.clean(html, is_full_page, page_title, opts)
     if not html or html == "" then return html end
+    opts = opts or {}
+    local keep_references = opts.keep_references == true
+
+    -- Extract article title heading for full page view before body cropping
+    local header_html = nil
+    if is_full_page then
+        local first_heading = html:match('<h1[^>]-id="firstHeading"[^>]*>(.-)</h1>')
+            or html:match('<h1[^>]-class="[^"]-firstHeading[^"]-"[^>]*>(.-)</h1>')
+            or html:match('<h1[^>]*>(.-)</h1>')
+        local title_text = first_heading or page_title
+        if title_text and title_text ~= "" then
+            local clean_title = title_text:gsub("<[^>]+>", ""):match("^%s*(.-)%s*$")
+            if clean_title == "" then clean_title = page_title or "Wikipedia" end
+            local sub = html:match('<div[^>]-id="siteSub"[^>]*>(.-)</div>')
+            if not sub or sub == "" then
+                local ok_gettext, _ = pcall(require, "gettext")
+                if ok_gettext and _ then
+                    sub = _("From Wikipedia, the free encyclopedia")
+                else
+                    sub = "Vikipedi, özgür ansiklopedi"
+                end
+            else
+                sub = sub:gsub("<[^>]+>", ""):match("^%s*(.-)%s*$")
+            end
+            header_html = string.format(
+                '<header class="mw-body-header vector-page-titlebar">' ..
+                '<h1 id="firstHeading" class="firstHeading mw-first-heading">%s</h1>' ..
+                '<div class="siteSub">%s</div>' ..
+                '</header>',
+                clean_title, sub
+            )
+        end
+    end
 
     -- (1) Crop to the article-body div if present.
     local body_start = html:find('<div%s+class="[^"]-mw[%-_]parser[%-_]output')
@@ -78,67 +215,232 @@ function M.clean(html)
         end
     end
 
-    -- (2) Non-nesting noise — single-pass gsub each.
-    html = html:gsub("<script[^>]*>.-</script>", "")
-    html = html:gsub("<style[^>]*>.-</style>", "")
-    html = html:gsub("<noscript[^>]*>.-</noscript>", "")
-    html = html:gsub("<audio[^>]*>.-</audio>", "")
-    html = html:gsub("<video[^>]*>.-</video>", "")
-    html = html:gsub("</?picture[^>]*>", "")
-    html = html:gsub("<link[^>]*>", "")
-    html = html:gsub("<meta[^>]*>", "")
+    -- (2) Non-nesting noise — single-pass gsub each with fast probe guards.
+    if html:find("<!%-%-", 1, true) then html = html:gsub("<!%-%-.-%-%->", "") end
+    if html:find("<script", 1, true) then html = html:gsub("<script[^>]*>.-</script>", "") end
+    if html:find("<style", 1, true) then html = html:gsub("<style[^>]*>.-</style>", "") end
+    if html:find("<noscript", 1, true) then html = html:gsub("<noscript[^>]*>.-</noscript>", "") end
+    if html:find("<svg", 1, true) then html = html:gsub("<svg[^>]*>.-</svg>", "") end
+    if html:find("<audio", 1, true) then html = html:gsub("<audio[^>]*>.-</audio>", "") end
+    if html:find("<video", 1, true) then html = html:gsub("<video[^>]*>.-</video>", "") end
+    if html:find("picture", 1, true) then html = html:gsub("</?picture[^>]*>", "") end
+    if html:find("<link", 1, true) then html = html:gsub("<link[^>]*>", "") end
+    if html:find("<meta", 1, true) then html = html:gsub("<meta[^>]*>", "") end
+    if html:find("info%-icon", 1, true) then html = html:gsub('<a%s+[^>]-class="[^"]-info%-icon[^"]-"[^>]*>.-</a>', "") end
 
-    -- Extract lead image from infobox table if present,
-    -- converting it to a standard figure so the picture is preserved when the table is stripped.
-    local lead_fig = nil
-    local infobox = html:match('<table[^>]-class="[^"]-infobox[^"]-"[^>]*>(.-)</table>')
-    if infobox then
-        local img_tag = infobox:match('(<img%s+[^>]+>)')
-        if img_tag then
-            local cap = infobox:match('<[^>]-class="[^"]-infobox%-caption[^"]-"[^>]*>(.-)</[^>]+>')
-            lead_fig = string.format('<figure class="mw-halign-right">%s%s</figure>',
-                img_tag, cap and ("<figcaption>" .. cap .. "</figcaption>") or "")
+    -- Strip invisible Z3988 COinS bibliographic metadata (can be 10-25KB of unrenderable DOM bloat)
+    if html:find("Z3988", 1, true) then
+        html = html:gsub('<span%s+[^>]-class="[^"]-Z3988[^"]-"[^>]*>.-</span>', "")
+    end
+    -- Unwrap external image links to avoid "External link (offline)" dialog on broken/unloaded images
+    if html:find("nocookie", 1, true) or html:find("wikimedia", 1, true) then
+        html = html:gsub('<a%s+[^>]-href=[\"\']https?://[^\"\']*(?:nocookie%.net|wikimedia%.org|upload%.wikimedia)[^\"\']*[\"\'][^>]*>(.-)</a>', "%1")
+    end
+    -- Unwrap links that wrap exclusively an <img> so illustrations can be
+    -- wrapped in the zoomable viewer link. The old class="image",
+    -- href="...File:" and href="...Dosya:" passes were fully subsumed by the
+    -- generic pattern below, so they were removed (3 fewer full-document gsubs).
+    if html:find("<a", 1, true) and html:find("<img", 1, true) then
+        html = html:gsub('<a%s+[^>]*>(%s*<img[^>]+>%s*)</a>', "%1")
+    end
+
+    -- (3) Nesting blocks — balanced removal by class in a single pass.
+    local KEEP_NAVBOX = is_full_page
+    local block_classes = {
+        navbox       = KEEP_NAVBOX,
+        toccolours   = is_full_page,
+        nowraplinks  = is_full_page,
+        ambox        = is_full_page,
+        catlinks     = is_full_page,
+        printfooter  = is_full_page,
+        ["preview-warning"] = is_full_page,
+        ["mw-message-box"]  = is_full_page,
+        eraicon      = is_full_page,
+        ["wds-dropdown"]    = is_full_page,
+        metadata     = is_full_page,
+        hatnote      = not is_full_page,
+        -- Kept as a marker: the reference list sits inside a wrapper div, so
+        -- it is removed by its own balanced pass below.
+        references   = false,
+    }
+    if html:find("class=", 1, true) then
+        html = strip_class_blocks(html, block_classes)
+    end
+
+    -- Reader mode: references are often 30-40% of the cleaned HTML and
+    -- generate many extra MuPDF pages. Drop them by default; callers can
+    -- opt back in with { keep_references = true }.
+    if is_full_page and not keep_references then
+        html = strip_balanced_if(html, '<ol%s+[^>]-class="[^"]-references', "<ol", "</ol>", "references")
+    end
+
+    if is_full_page then
+        -- Coordinates and non-viewer audio widgets
+        if html:find("coordinates", 1, true) then
+            html = html:gsub('<span%s+[^>]-id="coordinates"[^>]*>.-</span>', "")
+            html = html:gsub('<div%s+[^>]-id="coordinates"[^>]*>.-</div>', "")
+        end
+        if html:find("noviewer", 1, true) then
+            html = html:gsub('<span%s+[^>]-class="[^"]-noviewer[^"]-"[^>]*>.-</span>', "")
+        end
+
+        if header_html then
+            html = header_html .. html
+        end
+    else
+        -- Extract lead image from infobox table if present,
+        -- converting it to a standard figure so the picture is preserved when the table is stripped.
+        local lead_fig = nil
+        if html:find("infobox", 1, true) then
+            local infobox = html:match('<table[^>]-class="[^"]-infobox[^"]-"[^>]*>(.-)</table>')
+            if infobox then
+                local img_tag = infobox:match('(<img%s+[^>]+>)')
+                if img_tag then
+                    local cap = infobox:match('<[^>]-class="[^"]-infobox%-caption[^"]-"[^>]*>(.-)</[^>]+>')
+                    lead_fig = string.format('<figure class="mw-halign-center">%s%s</figure>',
+                        img_tag, cap and ("<figcaption>" .. cap .. "</figcaption>") or "")
+                end
+            end
+        end
+
+        -- Lookup mode: drop every table, then place the salvaged lead figure
+        -- right before the first paragraph.
+        html = strip_balanced_if(html, "<table[%s>]", "<table", "</table>", "<table")
+        if lead_fig then
+            local p_start = html:find("<p[%s>]")
+            if p_start then
+                html = html:sub(1, p_start - 1) .. lead_fig .. html:sub(p_start)
+            else
+                html = lead_fig .. html
+            end
         end
     end
 
-    -- (3) Nesting blocks — balanced removal.
-    html = strip_balanced(html, "<table[%s>]", "<table", "</table>")
-    html = strip_balanced(html,
-        '<div%s+[^>]-class="[^"]-hatnote[^"]-"',
-        "<div", "</div>")
-    -- Editor notices & ambox-style banners.
-    html = strip_balanced(html,
-        '<div%s+[^>]-class="[^"]-ambox[^"]-"',
-        "<div", "</div>")
-    -- MediaWiki template/parser warnings baked into ZIM HTML.
-    -- These appear as <div class="preview-warning"> or mw-message-box variants.
-    html = strip_balanced(html,
-        '<div%s+[^>]-class="[^"]-preview%-warning[^"]-"',
-        "<div", "</div>")
-    html = strip_balanced(html,
-        '<div%s+[^>]-class="[^"]-mw%-message%-box[^"]-"',
-        "<div", "</div>")
-    -- "References" / footer crud often inside <ol class="references">
-    html = strip_balanced(html,
-        '<ol%s+[^>]-class="[^"]-references[^"]-"',
-        "<ol", "</ol>")
-
-    -- If an infobox lead figure was salvaged, place it right before the first paragraph
-    if lead_fig then
-        local p_start = html:find("<p[%s>]")
-        if p_start then
-            html = html:sub(1, p_start - 1) .. lead_fig .. html:sub(p_start)
-        else
-            html = lead_fig .. html
-        end
+    -- (4) Empty placeholders (both p and span).
+    if html:find("mw-empty", 1, true) then
+        html = html:gsub('<p[^>]-class="[^"]-mw%-empty[^"]-"[^>]*>.-</p>', "")
+        html = html:gsub('<span[^>]-class="[^"]-mw%-empty[^"]-"[^>]*>.-</span>', "")
     end
 
-    -- (4) Empty placeholders.
-    html = html:gsub('<p[^>]-class="[^"]-mw%-empty[^"]-"[^>]*>.-</p>', "")
+    -- Strip destructive inline styles that cause MuPDF layout bugs on e-ink
+    -- (line-height, font-size, width, height, float, clear, position, margin).
+    -- Only a small whitelist of harmless properties is kept, and values are
+    -- validated before being emitted: malformed declarations used to reach
+    -- MuPDF as e.g. "align>=<" and produced CSS syntax errors.
+    if html:find("style=", 1, true) then
+        local ALLOWED_STYLE_PROPS = {
+            ["background"] = true,
+            ["background-color"] = true,
+            ["border"] = true,
+            ["border-bottom"] = true,
+            ["border-collapse"] = true,
+            ["border-color"] = true,
+            ["border-left"] = true,
+            ["border-right"] = true,
+            ["border-spacing"] = true,
+            ["border-style"] = true,
+            ["border-top"] = true,
+            ["border-width"] = true,
+            ["caption-side"] = true,
+            ["color"] = true,
+            ["display"] = true,
+            ["font-family"] = true,
+            ["font-style"] = true,
+            ["font-variant"] = true,
+            ["font-weight"] = true,
+            ["letter-spacing"] = true,
+            ["list-style"] = true,
+            ["list-style-type"] = true,
+            ["padding"] = true,
+            ["padding-bottom"] = true,
+            ["padding-left"] = true,
+            ["padding-right"] = true,
+            ["padding-top"] = true,
+            ["text-align"] = true,
+            ["text-decoration"] = true,
+            ["text-indent"] = true,
+            ["vertical-align"] = true,
+            ["white-space"] = true,
+            ["word-spacing"] = true,
+        }
+        local function valid_style_value(v)
+            if not v or v == "" then return false end
+            if v:find("[<>\"'{}]") then return false end
+            -- Typical CSS values: numbers+units, colors, keywords, rgb(...), %.
+            return v:match("^[%w%s%.,#%%%(%)%-%+/]+$") ~= nil
+        end
+        local function filter_style(s)
+            if s:find("display%s*:%s*none") then
+                return 'style="display:none;"'
+            end
+            local parts = {}
+            for prop, val in s:gmatch("([%a%-]+)%s*:%s*([^;]+)") do
+                local p = prop:lower():match("^%s*(.-)%s*$")
+                local v = val:match("^%s*(.-)%s*$"):gsub("%s*!important%s*$", "")
+                if ALLOWED_STYLE_PROPS[p]
+                   and p ~= "line-height"
+                   and p ~= "font-size"
+                   and p ~= "width"
+                   and p ~= "height"
+                   and p ~= "float"
+                   and p ~= "clear"
+                   and p ~= "position"
+                   and not p:find("^margin")
+                   and not p:find("^column")
+                   and valid_style_value(v) then
+                    table.insert(parts, p .. ": " .. v)
+                end
+            end
+            if #parts == 0 then return "" end
+            return 'style="' .. table.concat(parts, "; ") .. '"'
+        end
+        html = html:gsub('style="([^"]*)"', filter_style)
+        html = html:gsub("style='([^']*)'", filter_style)
+    end
+
+    -- Remove hardcoded width attributes from tables and cells so CSS controls
+    -- them, and drop large width/height attributes from <img> (>= 80px wide,
+    -- >= 60px high) so illustrations scale to the page while small icons
+    -- (30px Commons, math, flags) stay small.
+    --
+    -- This used to be four whole-document gsubs whose patterns had to scan to
+    -- the end of every tag; on a 1 MB article that alone cost ~1.5 s. Walking
+    -- the tags once and rewriting only the matching ones costs ~0.1 s and
+    -- produces byte-identical output.
+    if html:find("width=", 1, true) then
+        html = html:gsub("<[%a][^>]*>", function(tag)
+            local name = tag:match("^<(%a+)"):lower()
+            if name == "table" or name == "td" or name == "th" or name == "col" then
+                return (tag:gsub('%s+width=(["\'])[%d%%]+%1', ""))
+            elseif name == "img" then
+                -- Width and height are rewritten in one pass: they can sit
+                -- next to each other, so two back-to-back gsubs would leave
+                -- the second one's leading space in place.
+                tag = tag:gsub('(%s+)(width|height)=(["\'])(%d+)%3', function(space, attr, q, value)
+                    local n = tonumber(value)
+                    if attr == "width" and n >= 80 then return "" end
+                    if attr == "height" and n >= 60 then return "" end
+                    return space .. attr .. "=" .. q .. value .. q
+                end)
+                return tag
+            end
+            return tag
+        end)
+    end
+
+    -- Ensure Fandom portable-infobox figures have mw-halign-center class for consistent centering
+    if html:find("pi-image", 1, true) then
+        html = html:gsub('(<figure%s+[^>]-class="[^"]-pi%-image[^"]-)"', '%1 mw-halign-center"')
+    end
+
     -- Compress runs of blank lines (cheap; helps MuPDF's whitespace handling).
     html = html:gsub("\n%s*\n", "\n")
 
     return html
+end
+
+function M.cleanFull(html, page_title, opts)
+    return M.clean(html, true, page_title, opts)
 end
 
 return M

@@ -96,10 +96,155 @@ function WikipediaZim:onReaderReady()
     self:registerSelectionHooks()
 end
 
+local function sanitizeDictLayout(dict_module)
+    if not dict_module or not dict_module.default_layout then return end
+    local layout = dict_module.default_layout
+    for i = #layout, 1, -1 do
+        local row = layout[i]
+        if type(row) == "table" then
+            for j = #row, 1, -1 do
+                if row[j] == "wikipedia_offline" then
+                    table.remove(row, j)
+                end
+            end
+            if #row == 0 then
+                table.remove(layout, i)
+            end
+        end
+    end
+end
+
+local function sanitizeDictButtonConfig()
+    local config = G_reader_settings:readSetting("dict_button_config")
+    if config and config.layout then
+        local modified = false
+        for i = #config.layout, 1, -1 do
+            local row = config.layout[i]
+            if type(row) == "table" then
+                for j = #row, 1, -1 do
+                    if row[j] == "wikipedia_offline" then
+                        table.remove(row, j)
+                        modified = true
+                    end
+                end
+                if #row == 0 then
+                    table.remove(config.layout, i)
+                    modified = true
+                end
+            end
+        end
+        if config.order then
+            for j = #config.order, 1, -1 do
+                if config.order[j] == "wikipedia_offline" then
+                    table.remove(config.order, j)
+                    modified = true
+                end
+            end
+        end
+        if modified then
+            G_reader_settings:saveSetting("dict_button_config", config)
+        end
+    end
+end
+
+function WikipediaZim:patchDictQuickLookup()
+    if not ok_dict or not DictQuickLookup or DictQuickLookup._wikipediazim_patched then
+        return
+    end
+    DictQuickLookup._wikipediazim_patched = true
+
+    -- Safeguard TextBoxWidget: if KOReader adjusts image.width/height for line layout,
+    -- ensure image.bb is properly scaled so it never overflows past the right border or overlaps text.
+    local ok_tbw, TextBoxWidget = pcall(require, "ui/widget/textboxwidget")
+    if ok_tbw and TextBoxWidget and not TextBoxWidget._wikipediazim_patched then
+        TextBoxWidget._wikipediazim_patched = true
+        local orig_renderImage = TextBoxWidget._renderImage
+        TextBoxWidget._renderImage = function(tb_self, start_row_idx)
+            if tb_self.line_num_to_image and tb_self.line_num_to_image[start_row_idx] then
+                local img = tb_self.line_num_to_image[start_row_idx]
+                if img and img.bb and img.width and img.height then
+                    local bw = img.bb:getWidth()
+                    local bh = img.bb:getHeight()
+                    if bw > img.width or bh > img.height then
+                        local ok_ri, RenderImage = pcall(require, "ui/renderimage")
+                        if ok_ri and RenderImage then
+                            if RenderImage.renderImageData and img._raw_data then
+                                local scaled = RenderImage:renderImageData(img._raw_data, #img._raw_data, false, img.width, img.height)
+                                if scaled then
+                                    img.bb:free()
+                                    img.bb = scaled
+                                end
+                            elseif RenderImage.scaleBlitBuffer then
+                                local scaled = RenderImage:scaleBlitBuffer(img.bb, img.width, img.height, true)
+                                if scaled then
+                                    img.bb:free()
+                                    img.bb = scaled
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            return orig_renderImage(tb_self, start_row_idx)
+        end
+    end
+
+    local orig_buildButtonLayout = DictQuickLookup.buildButtonLayout
+    DictQuickLookup.buildButtonLayout = function(dql_self)
+        if dql_self.ui and dql_self.ui.dictionary then
+            sanitizeDictLayout(dql_self.ui.dictionary)
+        end
+        sanitizeDictButtonConfig()
+
+        local dict_mod = dql_self.ui and dql_self.ui.dictionary
+        local orig_default_layout = dict_mod and dict_mod.default_layout
+        local temp_layout = nil
+        if dql_self.is_wiki and orig_default_layout then
+            local ok_u, u = pcall(require, "util")
+            if ok_u and u and u.tableDeepCopy then
+                temp_layout = u.tableDeepCopy(orig_default_layout)
+                dict_mod.default_layout = temp_layout
+            end
+        end
+
+        local buttons = orig_buildButtonLayout(dql_self)
+
+        if temp_layout and orig_default_layout then
+            dict_mod.default_layout = orig_default_layout
+        end
+
+        -- Deduplicate and enforce prefer_offline hiding
+        if buttons and type(buttons) == "table" then
+            local seen_offline = false
+            for i = #buttons, 1, -1 do
+                local row = buttons[i]
+                if type(row) == "table" then
+                    for j = #row, 1, -1 do
+                        local btn = row[j]
+                        if btn and btn.id == "wikipedia_offline" then
+                            if seen_offline or G_reader_settings:isTrue("wikipediazim_prefer_offline") then
+                                table.remove(row, j)
+                            else
+                                seen_offline = true
+                            end
+                        end
+                    end
+                    if #row == 0 then
+                        table.remove(buttons, i)
+                    end
+                end
+            end
+        end
+
+        return buttons
+    end
+end
+
 function WikipediaZim:registerSelectionHooks()
     self:addToHighlightDialog()
     self:registerDictButtons()
     self:hookWikipediaModule()
+    self:patchDictQuickLookup()
 end
 
 function WikipediaZim:addToHighlightDialog()
@@ -109,7 +254,7 @@ function WikipediaZim:addToHighlightDialog()
             id = "wikipedia_offline",
             text = _("Offline Wikipedia"),
             show_in_highlight_dialog_func = function()
-                return true
+                return not G_reader_settings:isTrue("wikipediazim_prefer_offline")
             end,
             callback = function()
                 if this.hold_pos and not this.selected_text then
@@ -132,6 +277,8 @@ end
 
 function WikipediaZim:registerDictButtons()
     if not self.ui or not self.ui.dictionary then return end
+    sanitizeDictLayout(self.ui.dictionary)
+    sanitizeDictButtonConfig()
     self.ui.dictionary:addToDictButtons({
         id = "wikipedia_offline",
         menu_text = _("Offline Wikipedia"),
@@ -140,12 +287,21 @@ function WikipediaZim:registerDictButtons()
         pairs_with = "wikipedia",
         conditional = true,
         show_func = function(dict_popup)
-            return not dict_popup.is_offline_wiki
+            if dict_popup.is_offline_wiki or dict_popup.is_wiki then
+                return false
+            end
+            if G_reader_settings:isTrue("wikipediazim_prefer_offline") then
+                return false
+            end
+            return true
         end,
         callback = function(dict_popup)
-            local word = dict_popup.lookupword or dict_popup.word
+            local word = dict_popup.word
             if (not word or word == "") and dict_popup.highlight and dict_popup.highlight.selected_text then
                 word = dict_popup.highlight.selected_text.text
+            end
+            if not word or word == "" then
+                word = dict_popup.lookupword
             end
             local boxes = dict_popup.word_boxes
             dict_popup:onClose(true)
@@ -178,7 +334,6 @@ function WikipediaZim:hookWikipediaModule()
                     return true
                 end
             end
-            if dict_close_callback then dict_close_callback() end
             self:searchFromSelection(word, boxes, dict_close_callback)
             return true
         end
@@ -222,6 +377,73 @@ function WikipediaZim:_rescan()
     return self:_ensureScanned()
 end
 
+local function getTempImageDir()
+    local base
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    if ok_ds and DataStorage and DataStorage.getDataDir then
+        base = DataStorage:getDataDir() .. "/cache"
+    else
+        base = os.getenv("TEMP") or os.getenv("TMP") or "/tmp"
+    end
+    local img_dir = base .. "/wikipediazim_img"
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs or not lfs then
+        ok_lfs, lfs = pcall(require, "lfs")
+    end
+    if ok_lfs and lfs and lfs.mkdir then
+        pcall(lfs.mkdir, base)
+        pcall(lfs.mkdir, img_dir)
+    end
+    return img_dir
+end
+
+local function cleanTempImageDir(max_files)
+    max_files = max_files or 300
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs or not lfs then ok_lfs, lfs = pcall(require, "lfs") end
+    if not ok_lfs or not lfs then return end
+    local dir = getTempImageDir()
+    if not lfs.attributes(dir, "mode") then return end
+    local entries = {}
+    for file in lfs.dir(dir) do
+        if file ~= "." and file ~= ".." then
+            local p = dir .. "/" .. file
+            local mtime = lfs.attributes(p, "modification") or 0
+            entries[#entries + 1] = { path = p, mtime = mtime }
+        end
+    end
+    if #entries > max_files then
+        table.sort(entries, function(a, b) return a.mtime < b.mtime end)
+        for i = 1, #entries - 150 do
+            pcall(os.remove, entries[i].path)
+        end
+    end
+end
+
+local function safe_image_filename(src, mime)
+    local ext = ".jpg"
+    if mime == "image/png" then ext = ".png"
+    elseif mime == "image/gif" then ext = ".gif"
+    elseif mime == "image/bmp" then ext = ".bmp"
+    elseif mime == "image/webp" then ext = ".webp"
+    elseif mime == "image/svg+xml" then ext = ".svg"
+    else
+        local e = src and src:match("%.([%a%d]+)$")
+        if e then ext = "." .. e:lower() end
+    end
+
+    local base = src:match("([^/]+)$") or src
+    base = base:gsub("%.%w+$", ""):gsub("[^%w_%-]", "_")
+    if #base > 32 then base = base:sub(1, 32) end
+    if #base == 0 then base = "img" end
+
+    local h = 5381
+    for i = 1, #src do
+        h = ((h * 33) + src:byte(i)) % 4294967296
+    end
+    return string.format("%s_%08x%s", base, h, ext)
+end
+
 function WikipediaZim:onCloseDocument() self:_releaseAll() end
 function WikipediaZim:onSuspend()       self:_releaseAll() end
 
@@ -230,9 +452,15 @@ function WikipediaZim:_releaseAll()
     self.history = {}
     self.current_entry = nil
     self.current_html  = nil
+    self._article_lru = nil
+    self._article_lru_keys = nil
+    self._extracted_img_files = nil
     if self.lookup_window then
         UIManager:close(self.lookup_window)
         self.lookup_window = nil
+    end
+    if cleanTempImageDir then
+        cleanTempImageDir()
     end
 end
 
@@ -253,6 +481,14 @@ function WikipediaZim:_buildSubMenu()
             text = _("Search articles"),
             enabled_func = function() return #self.library.zims > 0 end,
             callback = function() self:openSearchDialog() end,
+        },
+        {
+            text = _("Recent searches"),
+            enabled_func = function()
+                local h = self:getSearchHistory()
+                return #h > 0
+            end,
+            callback = function() self:showSearchHistoryMenu() end,
         },
         {
             text = _("Open main page"),
@@ -283,6 +519,22 @@ function WikipediaZim:_buildSubMenu()
             end,
             callback = function()
                 G_reader_settings:flipNilOrFalse("wikipediazim_prefer_offline")
+                if self.ui and self.ui.dictionary then
+                    sanitizeDictLayout(self.ui.dictionary)
+                end
+                sanitizeDictButtonConfig()
+            end,
+        },
+        {
+            text = _("Show references (slower)"),
+            checked_func = function()
+                return G_reader_settings:isTrue("wikipediazim_show_references")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("wikipediazim_show_references")
+                -- Cached HTML was cleaned with the previous setting.
+                self._article_lru = nil
+                self._article_lru_keys = nil
             end,
         },
         {
@@ -377,8 +629,106 @@ local function utf8_truncate(s, max_len)
     return s:sub(1, cut):gsub("%s+$", "")
 end
 
+-- Decode HTML entity codes commonly found in article texts, titles, and ZIM extracts
+local function decode_html_entities(s)
+    if not s or s == "" then return s or "" end
+    return s:gsub("&nbsp;", " ")
+            :gsub("&#160;", " ")
+            :gsub("&quot;", '"')
+            :gsub("&apos;", "'")
+            :gsub("&#39;", "'")
+            :gsub("&#x27;", "'")
+            :gsub("&#039;", "'")
+            :gsub("&lsquo;", "'")
+            :gsub("&rsquo;", "'")
+            :gsub("&#8216;", "'")
+            :gsub("&#8217;", "'")
+            :gsub("&#x2018;", "'")
+            :gsub("&#x2019;", "'")
+            :gsub("&amp;", "&")
+            :gsub("&lt;", "<")
+            :gsub("&gt;", ">")
+            :gsub("&ndash;", "–")
+            :gsub("&mdash;", "—")
+            :gsub("&#x2013;", "–")
+            :gsub("&#x2014;", "—")
+            :gsub("&#x(%x+);", function(h)
+                local n = tonumber(h, 16)
+                if n == 39 then return "'" end
+                if n == 34 then return '"' end
+                if n == 38 then return '&' end
+                if n and n >= 32 and n <= 126 then return string.char(n) end
+            end)
+            :gsub("&#(%d+);", function(d)
+                local n = tonumber(d)
+                if n == 39 then return "'" end
+                if n == 34 then return '"' end
+                if n == 38 then return '&' end
+                if n and n >= 32 and n <= 126 then return string.char(n) end
+            end)
+end
+
+-- Diacritics folding: converts accented / Turkish / circumflex characters to plain ASCII.
+-- Note: \195\162 is UTF-8 lowercase circumflex a, and \195\130 is uppercase circumflex A.
+-- Literal circumflex characters are strictly avoided in Lua source code.
+local function fold_to_ascii(s)
+    if not s or s == "" then return "" end
+    return s:gsub("\195\162", "a")
+            :gsub("\195\130", "A")
+            :gsub("\195\167", "c") -- ç
+            :gsub("\195\135", "C") -- Ç
+            :gsub("\196\159", "g") -- ğ
+            :gsub("\196\158", "G") -- Ğ
+            :gsub("\196\177", "i") -- ı
+            :gsub("\196\176", "I") -- İ
+            :gsub("\195\182", "o") -- ö
+            :gsub("\195\150", "O") -- Ö
+            :gsub("\197\159", "s") -- ş
+            :gsub("\197\158", "S") -- Ş
+            :gsub("\195\188", "u") -- ü
+            :gsub("\195\156", "U") -- Ü
+end
+
+-- Maps standard ASCII letters to common Turkish diacritic equivalents
+local function to_turkish_diacritics(s)
+    if not s or s == "" then return "" end
+    return s:gsub("c", "\195\167")
+            :gsub("C", "\195\135")
+            :gsub("g", "\196\159")
+            :gsub("G", "\196\158")
+            :gsub("o", "\195\182")
+            :gsub("O", "\195\150")
+            :gsub("s", "\197\159")
+            :gsub("S", "\197\158")
+            :gsub("u", "\195\188")
+            :gsub("U", "\195\156")
+end
+
+-- Generates circumflex variants for words containing 'a' or 'A' using byte escapes
+local function add_circumflex_variants(word, add_fn)
+    local indices = {}
+    local p = 1
+    while true do
+        local i = word:find("[aA]", p)
+        if not i then break end
+        indices[#indices + 1] = i
+        p = i + 1
+        if #indices >= 3 then break end
+    end
+    for _, idx in ipairs(indices) do
+        local is_upper = word:sub(idx, idx) == "A"
+        local rep = is_upper and "\195\130" or "\195\162"
+        local v = word:sub(1, idx - 1) .. rep .. word:sub(idx + 1)
+        add_fn(v)
+    end
+    if #indices > 1 then
+        local v = word:gsub("a", "\195\162"):gsub("A", "\195\130")
+        add_fn(v)
+    end
+end
+
 -- Generate search candidate URLs supporting Unicode, Turkish characters,
--- multiword phrases, and title-cased variants.
+-- circumflex variants (\195\162 / \195\130), multiword phrases, and title-cased variants.
 function WikipediaZim:_getSearchCandidates(query)
     local candidates = {}
     local seen = {}
@@ -403,6 +753,7 @@ function WikipediaZim:_getSearchCandidates(query)
         uppers[#uppers + 1] = "I"
     elseif first_char == "\196\177" then -- Turkish dotless 'ı' -> 'I'
         uppers[#uppers + 1] = "I"
+        uppers[#uppers + 1] = "\196\176"
     elseif first_char == "\196\176" then -- 'İ'
         uppers[#uppers + 1] = "\196\176"
         uppers[#uppers + 1] = "I"
@@ -411,14 +762,43 @@ function WikipediaZim:_getSearchCandidates(query)
         uppers[#uppers + 1] = "\196\176"
     elseif first_char == "\195\167" then -- ç -> Ç
         uppers[#uppers + 1] = "\195\135"
+        uppers[#uppers + 1] = "C"
+    elseif first_char == "c" or first_char == "C" then
+        uppers[#uppers + 1] = "C"
+        uppers[#uppers + 1] = "\195\135"
     elseif first_char == "\196\159" then -- ğ -> Ğ
+        uppers[#uppers + 1] = "\196\158"
+        uppers[#uppers + 1] = "G"
+    elseif first_char == "g" or first_char == "G" then
+        uppers[#uppers + 1] = "G"
         uppers[#uppers + 1] = "\196\158"
     elseif first_char == "\195\182" then -- ö -> Ö
         uppers[#uppers + 1] = "\195\150"
+        uppers[#uppers + 1] = "O"
+    elseif first_char == "o" or first_char == "O" then
+        uppers[#uppers + 1] = "O"
+        uppers[#uppers + 1] = "\195\150"
     elseif first_char == "\197\159" then -- ş -> Ş
+        uppers[#uppers + 1] = "\197\158"
+        uppers[#uppers + 1] = "S"
+    elseif first_char == "s" or first_char == "S" then
+        uppers[#uppers + 1] = "S"
         uppers[#uppers + 1] = "\197\158"
     elseif first_char == "\195\188" then -- ü -> Ü
         uppers[#uppers + 1] = "\195\156"
+        uppers[#uppers + 1] = "U"
+    elseif first_char == "u" or first_char == "U" then
+        uppers[#uppers + 1] = "U"
+        uppers[#uppers + 1] = "\195\156"
+    elseif first_char == "\195\162" then -- circumflex a -> A
+        uppers[#uppers + 1] = "\195\130"
+        uppers[#uppers + 1] = "A"
+    elseif first_char == "\195\130" then -- circumflex A -> A
+        uppers[#uppers + 1] = "\195\130"
+        uppers[#uppers + 1] = "A"
+    elseif first_char == "a" or first_char == "A" then
+        uppers[#uppers + 1] = "A"
+        uppers[#uppers + 1] = "\195\130"
     elseif #first_char == 1 and first_char >= "a" and first_char <= "z" then
         uppers[#uppers + 1] = first_char:upper()
     else
@@ -443,6 +823,7 @@ function WikipediaZim:_getSearchCandidates(query)
             elseif w_first == "\195\182" then w_up = "\195\150"
             elseif w_first == "\197\159" then w_up = "\197\158"
             elseif w_first == "\195\188" then w_up = "\195\156"
+            elseif w_first == "\195\162" or w_first == "\195\130" then w_up = "\195\130"
             elseif #w_first == 1 and w_first >= "a" and w_first <= "z" then
                 w_up = w_first:upper()
             end
@@ -450,7 +831,7 @@ function WikipediaZim:_getSearchCandidates(query)
         end
         add(table.concat(words, "_"))
 
-        -- Turkish title-cased candidate if any word starts with i or ı
+        -- Turkish title-cased candidate if any word starts with special char
         local tr_words = {}
         local has_tr = false
         for word in raw_url:gmatch("[^_]+") do
@@ -462,11 +843,24 @@ function WikipediaZim:_getSearchCandidates(query)
             elseif w_first == "\196\177" then
                 w_up = "I"
                 has_tr = true
-            elseif w_first == "\195\167" then w_up = "\195\135"
-            elseif w_first == "\196\159" then w_up = "\196\158"
-            elseif w_first == "\195\182" then w_up = "\195\150"
-            elseif w_first == "\197\159" then w_up = "\197\158"
-            elseif w_first == "\195\188" then w_up = "\195\156"
+            elseif w_first == "\195\167" or w_first == "c" then
+                w_up = "\195\135"
+                has_tr = true
+            elseif w_first == "\196\159" or w_first == "g" then
+                w_up = "\196\158"
+                has_tr = true
+            elseif w_first == "\195\182" or w_first == "o" then
+                w_up = "\195\150"
+                has_tr = true
+            elseif w_first == "\197\159" or w_first == "s" then
+                w_up = "\197\158"
+                has_tr = true
+            elseif w_first == "\195\188" or w_first == "u" then
+                w_up = "\195\156"
+                has_tr = true
+            elseif w_first == "\195\162" or w_first == "\195\130" or w_first == "a" then
+                w_up = "\195\130"
+                has_tr = true
             elseif #w_first == 1 and w_first >= "a" and w_first <= "z" then
                 w_up = w_first:upper()
             end
@@ -477,7 +871,43 @@ function WikipediaZim:_getSearchCandidates(query)
         end
     end
 
-    -- 3. Raw URL as typed/selected (e.g. for "iPhone", "eBay")
+    -- 3. Diacritics folding: fold any accented/circumflex/Turkish characters to plain ASCII
+    local folded = fold_to_ascii(raw_url)
+    if folded ~= raw_url then
+        local f_first, f_rest = utf8_first_char(folded)
+        add(f_first:upper() .. f_rest)
+        add(folded)
+    end
+
+    -- 4. Diacritics unfolding: generate Turkish diacritics variants
+    local tr_converted = to_turkish_diacritics(raw_url)
+    if tr_converted ~= raw_url then
+        local t_first, t_rest = utf8_first_char(tr_converted)
+        local t_up = t_first
+        if t_first == "\195\167" then t_up = "\195\135"
+        elseif t_first == "\196\159" then t_up = "\196\158"
+        elseif t_first == "\195\182" then t_up = "\195\150"
+        elseif t_first == "\197\159" then t_up = "\197\158"
+        elseif t_first == "\195\188" then t_up = "\195\156"
+        elseif #t_first == 1 and t_first >= "a" and t_first <= "z" then t_up = t_first:upper() end
+        add(t_up .. t_rest)
+    end
+
+    -- 5. Circumflex a (\195\162) variants for words with 'a' or 'A'
+    if raw_url:find("[aA]") then
+        add_circumflex_variants(raw_url, function(v)
+            local v_first, v_rest = utf8_first_char(v)
+            local v_up = v_first
+            if v_first == "a" or v_first == "A" or v_first == "\195\162" or v_first == "\195\130" then
+                v_up = (v_first == "\195\162" or v_first == "\195\130") and "\195\130" or "A"
+            elseif #v_first == 1 and v_first >= "a" and v_first <= "z" then
+                v_up = v_first:upper()
+            end
+            add(v_up .. v_rest)
+        end)
+    end
+
+    -- 6. Raw URL as typed/selected (e.g. for "iPhone", "eBay")
     add(raw_url)
 
     return candidates
@@ -491,6 +921,77 @@ end
 local function url_decode(s)
     if not s then return s end
     return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+local function url_encode(s)
+    if not s then return "" end
+    return (s:gsub("([^%w_%-%.~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end))
+end
+
+function WikipediaZim:recordSearchHistory(q)
+    if not q or q == "" then return end
+    q = q:gsub("^%s+", ""):gsub("%s+$", "")
+    if q == "" then return end
+    local history = G_reader_settings:readSetting("wikipediazim_search_history") or {}
+    for i = #history, 1, -1 do
+        if history[i] == q then
+            table.remove(history, i)
+        end
+    end
+    table.insert(history, 1, q)
+    while #history > 15 do
+        table.remove(history)
+    end
+    G_reader_settings:saveSetting("wikipediazim_search_history", history)
+end
+
+function WikipediaZim:getSearchHistory()
+    return G_reader_settings:readSetting("wikipediazim_search_history") or {}
+end
+
+function WikipediaZim:showSearchHistoryMenu(parent_dialog)
+    local history = self:getSearchHistory()
+    if #history == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No recent searches."),
+        })
+        return
+    end
+
+    local items = {}
+    for _, q in ipairs(history) do
+        local query_text = q
+        items[#items + 1] = {
+            text = query_text,
+            callback = function()
+                if parent_dialog then
+                    UIManager:close(parent_dialog)
+                end
+                self.last_search = query_text
+                self:runSearch(query_text)
+            end,
+        }
+    end
+    items[#items + 1] = {
+        text = _("Clear history"),
+        separator = true,
+        callback = function()
+            G_reader_settings:saveSetting("wikipediazim_search_history", {})
+            UIManager:show(InfoMessage:new{
+                text = _("Search history cleared."),
+            })
+        end,
+    }
+
+    local menu = Menu:new{
+        title = _("Recent searches"),
+        item_table = items,
+        is_popout = false,
+        width = math.min(Device.screen:getWidth() - 40, Screen:scaleBySize(450)),
+    }
+    UIManager:show(menu)
 end
 
 function WikipediaZim:openSearchDialog(initial_query, custom_title)
@@ -510,6 +1011,10 @@ function WikipediaZim:openSearchDialog(initial_query, custom_title)
         buttons = {{
             { text = _("Cancel"), id = "close",
               callback = function() UIManager:close(dialog) end },
+            { text = _("Recent"),
+              callback = function()
+                  self:showSearchHistoryMenu(dialog)
+              end },
             { text = _("Search"), is_enter_default = true,
               callback = function()
                   local q = dialog:getInputText()
@@ -556,6 +1061,7 @@ function WikipediaZim:runSearch(query, boxes, dict_close_callback)
     if query == "" then return end
 
     self.last_search = query
+    self:recordSearchHistory(query)
 
     local candidates = self:_getSearchCandidates(query)
     local results = {}
@@ -575,15 +1081,24 @@ function WikipediaZim:runSearch(query, boxes, dict_close_callback)
 
     -- 2. Fall back to title-prefix search if no exact match or to supplement results
     local max_results = 60
+    local prefix_seen = {}
     for _, cand in ipairs(candidates) do
         if #results >= max_results then break end
-        local prefix_hits = self.library:prefixSearch("C", cand, max_results - #results)
-        for _, hit in ipairs(prefix_hits) do
-            local key = (hit._base or "") .. ":" .. (hit.url or "")
-            if not seen_keys[key] then
-                seen_keys[key] = true
-                results[#results + 1] = hit
-                if #results >= max_results then break end
+        -- In ZIM namespace C, all standard MediaWiki article titles start uppercase.
+        -- If an uppercase candidate was already scanned, skip redundant lowercased scan.
+        local first_char = utf8_first_char(cand)
+        local is_lower = (#first_char == 1 and first_char >= "a" and first_char <= "z")
+        local norm_cand = is_lower and (first_char:upper() .. cand:sub(#first_char + 1)) or cand
+        if not prefix_seen[norm_cand] then
+            prefix_seen[norm_cand] = true
+            local prefix_hits = self.library:prefixSearch("C", cand, max_results - #results)
+            for _, hit in ipairs(prefix_hits) do
+                local key = (hit._base or "") .. ":" .. (hit.url or "")
+                if not seen_keys[key] then
+                    seen_keys[key] = true
+                    results[#results + 1] = hit
+                    if #results >= max_results then break end
+                end
             end
         end
     end
@@ -613,45 +1128,49 @@ local function base64_encode(data)
         local ok, res = pcall(sha2.bin_to_base64, data)
         if ok and res then return res end
     end
+    local ok_ffi, ffi = pcall(require, "ffi")
     local ok_bit, bit = pcall(require, "bit")
-    local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    if ok_bit and bit then
-        local band, rshift, lshift = bit.band, bit.rshift, bit.lshift
-        local bytes = { string.byte(b64chars, 1, 64) }
+    if ok_ffi and ffi and ok_bit and bit then
         local len = #data
-        local t = {}
-        local pad = len % 3
-        local clean_len = len - pad
-        for i = 1, clean_len, 3 do
-            local b1, b2, b3 = data:byte(i, i + 2)
-            local n = lshift(b1, 16) + lshift(b2, 8) + b3
-            t[#t + 1] = string.char(
-                bytes[rshift(n, 18) + 1],
-                bytes[band(rshift(n, 12), 63) + 1],
-                bytes[band(rshift(n, 6), 63) + 1],
-                bytes[band(n, 63) + 1]
-            )
+        local out_len = math.floor((len + 2) / 3) * 4
+        local out = ffi.new("uint8_t[?]", out_len)
+        local src = ffi.cast("const uint8_t*", data)
+        local b64_table = ffi.new("const uint8_t[65]", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+        local si, di = 0, 0
+        local full_chunks = math.floor(len / 3)
+        for _ = 1, full_chunks do
+            local b0 = src[si]
+            local b1 = src[si + 1]
+            local b2 = src[si + 2]
+            out[di]     = b64_table[bit.rshift(b0, 2)]
+            out[di + 1] = b64_table[bit.bor(bit.band(bit.lshift(b0, 4), 0x30), bit.rshift(b1, 4))]
+            out[di + 2] = b64_table[bit.bor(bit.band(bit.lshift(b1, 2), 0x3C), bit.rshift(b2, 6))]
+            out[di + 3] = b64_table[bit.band(b2, 0x3F)]
+            si = si + 3
+            di = di + 4
         end
-        if pad == 1 then
-            local b1 = data:byte(len)
-            local n = lshift(b1, 16)
-            t[#t + 1] = string.char(
-                bytes[rshift(n, 18) + 1],
-                bytes[band(rshift(n, 12), 63) + 1],
-                61, 61
-            )
-        elseif pad == 2 then
-            local b1, b2 = data:byte(len - 1, len)
-            local n = lshift(b1, 16) + lshift(b2, 8)
-            t[#t + 1] = string.char(
-                bytes[rshift(n, 18) + 1],
-                bytes[band(rshift(n, 12), 63) + 1],
-                bytes[band(rshift(n, 6), 63) + 1],
-                61
-            )
+
+        local remain = len % 3
+        if remain == 1 then
+            local b0 = src[si]
+            out[di]     = b64_table[bit.rshift(b0, 2)]
+            out[di + 1] = b64_table[bit.band(bit.lshift(b0, 4), 0x30)]
+            out[di + 2] = 61
+            out[di + 3] = 61
+        elseif remain == 2 then
+            local b0 = src[si]
+            local b1 = src[si + 1]
+            out[di]     = b64_table[bit.rshift(b0, 2)]
+            out[di + 1] = b64_table[bit.bor(bit.band(bit.lshift(b0, 4), 0x30), bit.rshift(b1, 4))]
+            out[di + 2] = b64_table[bit.band(bit.lshift(b1, 2), 0x3C)]
+            out[di + 3] = 61
         end
-        return table.concat(t)
+
+        return ffi.string(out, out_len)
     end
+
+    local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     return ((data:gsub('.', function(x)
         local r,b='',x:byte()
         for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
@@ -666,12 +1185,28 @@ end
 
 local function convert_to_png(raw_data)
     if not raw_data or #raw_data == 0 then return nil end
+    local max_w = 1264
+    local max_h = 1680
 
     -- Strategy 1: KOReader's RenderImage
     local ok_ri, RenderImage = pcall(require, "ui/renderimage")
     local bb = nil
     if ok_ri and RenderImage and RenderImage.renderImageData then
         bb = RenderImage:renderImageData(raw_data, #raw_data)
+        if bb then
+            local bw = bb:getWidth()
+            local bh = bb:getHeight()
+            if bw > max_w or bh > max_h then
+                local scale = math.min(max_w / bw, max_h / bh)
+                local target_w = math.max(1, math.floor(bw * scale))
+                local target_h = math.max(1, math.floor(bh * scale))
+                local scaled_bb = RenderImage:renderImageData(raw_data, #raw_data, false, target_w, target_h)
+                if scaled_bb then
+                    bb:free()
+                    bb = scaled_bb
+                end
+            end
+        end
     end
 
     -- Strategy 2: Direct ffi/webp if RenderImage didn't handle it
@@ -718,6 +1253,24 @@ local function convert_to_png(raw_data)
 
     -- Write BlitBuffer to temporary PNG and read back encoded PNG bytes
     if bb then
+        local bw = bb:getWidth()
+        local bh = bb:getHeight()
+        if bw > max_w or bh > max_h then
+            local scale = math.min(max_w / bw, max_h / bh)
+            local target_w = math.max(1, math.floor(bw * scale))
+            local target_h = math.max(1, math.floor(bh * scale))
+            local ok_ri2, RenderImage2 = pcall(require, "ui/renderimage")
+            if ok_ri2 and RenderImage2 and RenderImage2.scaleBlitBuffer then
+                bb = RenderImage2:scaleBlitBuffer(bb, target_w, target_h, true)
+            elseif bb.scale then
+                local scaled_bb = bb:scale(target_w, target_h)
+                if scaled_bb then
+                    bb:free()
+                    bb = scaled_bb
+                end
+            end
+        end
+
         local tmp_dir = "/tmp"
         local ok_ds, DataStorage = pcall(require, "datastorage")
         if ok_ds and DataStorage and DataStorage.getDataDir then
@@ -757,39 +1310,36 @@ function WikipediaZim:_resolveImageBlob(z, src)
     if not z or not src or src == "" then return nil end
     if src:match("^https?://") or src:match("^data:") then return nil end
 
-    if not z._img_cache then z._img_cache = {} end
-    if z._img_cache[src] then
+    if not z._img_cache then
+        z._img_cache = {}
+        z._img_cache_keys = {}
+    end
+    if z._img_cache[src] ~= nil then
+        if not z._img_cache[src] then return nil end
         return z._img_cache[src].data, z._img_cache[src].mime
     end
 
     src = src:gsub("#.*$", ""):gsub("%?.*$", "")
     local clean = src:gsub("^%./", ""):gsub("^%.%./", ""):gsub("^/", "")
     local decoded = url_decode(clean)
-    local decoded2 = url_decode(decoded)
 
     local candidates = {
         { ns = "C", url = clean },
         { ns = "C", url = decoded },
-        { ns = "C", url = decoded2 },
+        { ns = "-", url = clean },
         { ns = "I", url = clean },
         { ns = "I", url = decoded },
-        { ns = "I", url = decoded2 },
-        { ns = "-", url = clean },
-        { ns = "-", url = decoded },
-        { ns = "-", url = decoded2 },
     }
 
     if clean:match("^I/") then
         local sub = clean:sub(3)
         table.insert(candidates, { ns = "I", url = sub })
         table.insert(candidates, { ns = "I", url = url_decode(sub) })
-        table.insert(candidates, { ns = "I", url = url_decode(url_decode(sub)) })
     end
     if clean:match("^%-/") then
         local sub = clean:sub(3)
         table.insert(candidates, { ns = "-", url = sub })
         table.insert(candidates, { ns = "-", url = url_decode(sub) })
-        table.insert(candidates, { ns = "-", url = url_decode(url_decode(sub)) })
     end
 
     local seen = {}
@@ -797,67 +1347,78 @@ function WikipediaZim:_resolveImageBlob(z, src)
         local key = c.ns .. ":" .. c.url
         if not seen[key] then
             seen[key] = true
-            if z._img_cache[key] then
-                z._img_cache[src] = z._img_cache[key]
-                return z._img_cache[key].data, z._img_cache[key].mime
-            end
-
-            local entry = z:findExact(c.ns, c.url)
-            if entry and entry.kind == "redirect" then
-                entry = z:resolveRedirect(entry)
-            end
-            if entry and entry.kind == "article" then
-                local data, mime = z:readArticle(entry)
-                if data and #data > 0 then
-                    local is_native = false
-                    if #data >= 4 then
-                        local b1, b2, b3, b4 = data:byte(1, 4)
-                        if b1 == 0xFF and b2 == 0xD8 then
-                            mime = "image/jpeg"
+            if z._img_cache[key] ~= nil then
+                if z._img_cache[key] then
+                    z._img_cache[src] = z._img_cache[key]
+                    return z._img_cache[key].data, z._img_cache[key].mime
+                end
+            else
+                local entry = z:findExact(c.ns, c.url)
+                if entry and entry.kind == "redirect" then
+                    entry = z:resolveRedirect(entry)
+                end
+                if entry and entry.kind == "article" then
+                    local data, mime = z:readArticle(entry)
+                    if data and #data > 0 then
+                        local is_native = false
+                        if #data >= 12 and data:sub(1, 4) == "RIFF" and data:sub(9, 12) == "WEBP" then
+                            mime = "image/webp"
                             is_native = true
-                        elseif b1 == 0x89 and b2 == 0x50 and b3 == 0x4E and b4 == 0x47 then
-                            mime = "image/png"
-                            is_native = true
-                        elseif b1 == 0x47 and b2 == 0x49 and b3 == 0x46 and b4 == 0x38 then
-                            mime = "image/gif"
-                            is_native = true
-                        elseif b1 == 0x42 and b2 == 0x4D then
-                            mime = "image/bmp"
-                            is_native = true
+                        elseif #data >= 4 then
+                            local b1, b2, b3, b4 = data:byte(1, 4)
+                            if b1 == 0xFF and b2 == 0xD8 then
+                                mime = "image/jpeg"
+                                is_native = true
+                            elseif b1 == 0x89 and b2 == 0x50 and b3 == 0x4E and b4 == 0x47 then
+                                mime = "image/png"
+                                is_native = true
+                            elseif b1 == 0x47 and b2 == 0x49 and b3 == 0x46 and b4 == 0x38 then
+                                mime = "image/gif"
+                                is_native = true
+                            elseif b1 == 0x42 and b2 == 0x4D then
+                                mime = "image/bmp"
+                                is_native = true
+                            end
                         end
-                    end
 
-                    -- If format is not natively decoded by MuPDF HTML engine (e.g. WebP or SVG),
-                    -- convert it to standard PNG so MuPDF renders it seamlessly.
-                    if not is_native then
-                        local converted = convert_to_png(data)
-                        if converted and #converted > 0 then
-                            data = converted
-                            mime = "image/png"
-                        else
-                            if not mime or mime == "application/octet-stream" then
-                                local ext = c.url:match("%.([%a%d]+)$")
-                                if ext then
-                                    ext = ext:lower()
-                                    if ext == "jpg" or ext == "jpeg" then mime = "image/jpeg"
-                                    elseif ext == "png" then mime = "image/png"
-                                    elseif ext == "webp" then mime = "image/webp"
-                                    elseif ext == "gif" then mime = "image/gif"
-                                    elseif ext == "svg" then mime = "image/svg+xml"
+                        -- If format is not natively decoded by MuPDF HTML engine (e.g. SVG or uncompressed BMP),
+                        -- convert it to PNG. Native images (JPEG, PNG, WebP, GIF) are passed directly to MuPDF.
+                        if not is_native then
+                            local converted = convert_to_png(data)
+                            if converted and #converted > 0 then
+                                data = converted
+                                mime = "image/png"
+                            else
+                                if not mime or mime == "application/octet-stream" then
+                                    local ext = c.url:match("%.([%a%d]+)$")
+                                    if ext then
+                                        ext = ext:lower()
+                                        if ext == "jpg" or ext == "jpeg" then mime = "image/jpeg"
+                                        elseif ext == "png" then mime = "image/png"
+                                        elseif ext == "webp" then mime = "image/webp"
+                                        elseif ext == "gif" then mime = "image/gif"
+                                        elseif ext == "svg" then mime = "image/svg+xml"
+                                        end
                                     end
                                 end
                             end
                         end
-                    end
 
-                    local res = { data = data, mime = mime or "image/jpeg" }
-                    z._img_cache[key] = res
-                    z._img_cache[src] = res
-                    return res.data, res.mime
+                        local res = { data = data, mime = mime or "image/jpeg" }
+                        if #z._img_cache_keys >= 16 then
+                            local oldest = table.remove(z._img_cache_keys, 1)
+                            z._img_cache[oldest] = nil
+                        end
+                        z._img_cache_keys[#z._img_cache_keys + 1] = key
+                        z._img_cache[key] = res
+                        z._img_cache[src] = res
+                        return res.data, res.mime
+                    end
                 end
             end
         end
     end
+    z._img_cache[src] = false
     return nil
 end
 
@@ -884,38 +1445,99 @@ function WikipediaZim:_getLeadImageForArticle(z, article_url)
     return nil
 end
 
+function WikipediaZim:_resolveImageFile(z, src)
+    if not z or not src or src == "" then return nil end
+    if src:match("^https?://") or src:match("^data:") then return nil end
+
+    if not z._img_file_cache then z._img_file_cache = {} end
+    if z._img_file_cache[src] ~= nil then
+        return z._img_file_cache[src] or nil
+    end
+
+    local data, mime = self:_resolveImageBlob(z, src)
+    if not data or #data == 0 then
+        z._img_file_cache[src] = false
+        return nil
+    end
+
+    local filename = safe_image_filename(src, mime)
+    local img_dir = getTempImageDir()
+    local filepath = img_dir .. "/" .. filename
+
+    if not self._extracted_img_files then self._extracted_img_files = {} end
+    if not self._extracted_img_files[filename] then
+        local exists_file = io.open(filepath, "rb")
+        if exists_file then
+            exists_file:close()
+        else
+            local f = io.open(filepath, "wb")
+            if f then
+                f:write(data)
+                f:close()
+            end
+        end
+        self._extracted_img_files[filename] = true
+    end
+
+    z._img_file_cache[src] = filename
+    return filename
+end
+
+local function is_decorative_icon(src)
+    if not src then return true end
+    local s = src:lower()
+    return s:find("flag") or s:find("icon") or s:find("pog") or s:find("arrow")
+        or s:find("symbol") or s:find("lock") or s:find("increase") or s:find("decrease")
+        or s:find("bullet") or s:find("portal") or s:find("edit") or s:find("magnify")
+end
+
 function WikipediaZim:_embedImagesInHtml(z, html, article_url)
     if not html or html == "" then return html end
 
-    local max_images = 30
-    local count = 0
-
-    local function replace_img_src(prefix, src, suffix)
-        if count >= max_images then return prefix .. src .. suffix end
-        local data, mime = self:_resolveImageBlob(z, src)
-        if data then
-            count = count + 1
-            local b64 = base64_encode(data)
-            return prefix .. "data:" .. mime .. ";base64," .. b64 .. suffix
-        end
-        return prefix .. src .. suffix
+    local BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+    local show_image = G_reader_settings:nilOrTrue("wikipedia_show_image")
+    if not show_image then
+        -- Fast path: blank all image sources if image display is disabled
+        return html:gsub('(<img%s+[^>]-src=")[^"]*(")', "%1" .. BLANK_GIF .. "%2")
+                   :gsub("(<img%s+[^>]-src=')[^']*(')", "%1" .. BLANK_GIF .. "%2")
     end
 
-    local dq = string.char(34)
-    local sq = string.char(39)
-    local replaced_html = html:gsub("(<img%s+[^>]*src=" .. dq .. ")([^" .. dq .. "]+)(" .. dq .. ")", replace_img_src)
-    replaced_html = replaced_html:gsub("(<img%s+[^>]*src=" .. sq .. ")([^" .. sq .. "]+)(" .. sq .. ")", replace_img_src)
+    local max_images = 6
+    local count = 0
+
+    local replaced_html = html
+    local has_img = html:find("<img", 1, true)
+
+    if has_img then
+        local dq = string.char(34)
+        local sq = string.char(39)
+
+        local function replace_and_wrap(tag_start, src, tag_end)
+            if is_decorative_icon(src) or count >= max_images then
+                return tag_start .. BLANK_GIF .. tag_end
+            end
+            local filename = self:_resolveImageFile(z, src)
+            if filename then
+                count = count + 1
+                local img_tag = tag_start .. filename .. tag_end
+                return '<a href="zim-img-zoom:' .. filename .. '" class="zim-img-zoom">' .. img_tag .. '</a>'
+            end
+            return tag_start .. BLANK_GIF .. tag_end
+        end
+
+        replaced_html = replaced_html:gsub("(<img%s+[^>]-src=" .. dq .. ")([^" .. dq .. "]+)(" .. dq .. "[^>]*>)", replace_and_wrap)
+        replaced_html = replaced_html:gsub("(<img%s+[^>]-src=" .. sq .. ")([^" .. sq .. "]+)(" .. sq .. "[^>]*>)", replace_and_wrap)
+    end
 
     if count == 0 and article_url and z then
         local lead_src, caption = self:_getLeadImageForArticle(z, article_url)
         if lead_src then
-            local data, mime = self:_resolveImageBlob(z, lead_src)
-            if data then
-                local b64 = base64_encode(data)
-                local data_uri = "data:" .. mime .. ";base64," .. b64
+            local filename = self:_resolveImageFile(z, lead_src)
+            if filename then
+                local enc_cap = (caption and caption ~= "") and ("|" .. url_encode(caption)) or ""
                 local fig = string.format(
-                    '<figure class="mw-halign-right"><img src="%s"><figcaption>%s</figcaption></figure>',
-                    data_uri, caption or ""
+                    '<figure class="mw-halign-center"><a href="zim-img-zoom:%s%s" class="zim-img-zoom"><img src="%s"></a><figcaption>%s</figcaption></figure>',
+                    filename, enc_cap, filename, caption or ""
                 )
                 local p_start = replaced_html:find("<p[%s>]")
                 if p_start then
@@ -923,7 +1545,38 @@ function WikipediaZim:_embedImagesInHtml(z, html, article_url)
                 else
                     replaced_html = fig .. replaced_html
                 end
+                count = count + 1
             end
+        end
+    end
+
+    -- Extract caption for figures and thumbs so ImageViewer can display it as subtitle
+    if count > 0 then
+        if replaced_html:find("<figcaption", 1, true) then
+            replaced_html = replaced_html:gsub("(<figure[^>]*>)(.-)(</figure>)", function(p1, content, p2)
+                local cap = content:match("<figcaption[^>]*>(.-)</figcaption>")
+                if cap then
+                    local clean_cap = cap:gsub("<[^>]+>", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                    if clean_cap ~= "" then
+                        local enc_cap = url_encode(clean_cap)
+                        content = content:gsub('(href="zim%-img%-zoom:[^"|]+)', function(m) return m .. "|" .. enc_cap end)
+                    end
+                end
+                return p1 .. content .. p2
+            end)
+        end
+        if replaced_html:find("thumbcaption", 1, true) then
+            replaced_html = replaced_html:gsub('(<div[^>]-class="[^"]-thumb[^"]-"[^>]*>)(.-)(</div>)', function(p1, content, p2)
+                local cap = content:match('<div[^>]-class="[^"]-thumbcaption[^"]-"[^>]*>(.-)</div>')
+                if cap then
+                    local clean_cap = cap:gsub("<[^>]+>", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                    if clean_cap ~= "" then
+                        local enc_cap = url_encode(clean_cap)
+                        content = content:gsub('(href="zim%-img%-zoom:[^"|]+)', function(m) return m .. "|" .. enc_cap end)
+                    end
+                end
+                return p1 .. content .. p2
+            end)
         end
     end
 
@@ -1007,36 +1660,61 @@ function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article
         return nil
     end
 
-    local target_w = 200
+    -- Target dimensions for the dictionary popup lead image:
+    -- On Kindle/e-ink, definition_height in DictQuickLookup is ~0.35 * screen height (~560px on PW5).
+    -- TextBoxWidget strictly caps image height to math.floor(self.height / 2) (~280px on PW5).
+    -- If image height exceeds this, TextBoxWidget modifies image.height without resizing image.bb,
+    -- which causes text to overlap the unscaled bottom of image.bb and right clipping.
+    -- Therefore, max_h must be safely below 0.16 * screen height (scaleBySize(135) ≈ 242px).
+    -- Similarly, max_w is bounded to scaleBySize(130) ≈ 233px.
+    local max_w = 150
+    local max_h = 150
     local ok_dev, Device = pcall(require, "device")
     if ok_dev and Device and Device.screen and Device.screen.scaleBySize then
-        target_w = Device.screen:scaleBySize(180)
+        max_w = Device.screen:scaleBySize(130)
+        max_h = Device.screen:scaleBySize(135)
     end
 
-    local bb = RenderImage:renderImageData(data, #data)
+    -- Render directly at target dimensions in a single pass, avoiding allocating
+    -- massive multi-megabyte unscaled bitmaps on Kindle RAM.
+    local bb = RenderImage:renderImageData(data, #data, false, max_w, max_h)
     if not bb then return nil end
 
     local bw = bb:getWidth()
     local bh = bb:getHeight()
-    if bw > target_w then
-        local target_h = math.max(1, math.floor(target_w * bh / bw))
-        local scaled = RenderImage:renderImageData(data, #data, false, target_w, target_h)
+    if bw > max_w or bh > max_h then
+        local scale = math.min(max_w / bw, max_h / bh)
+        local target_w = math.max(1, math.floor(bw * scale))
+        local target_h = math.max(1, math.floor(bh * scale))
+        local scaled = (RenderImage.scaleBlitBuffer and RenderImage:scaleBlitBuffer(bb, target_w, target_h, true))
+            or RenderImage:renderImageData(data, #data, false, target_w, target_h)
         if scaled then
-            bb:free()
+            if scaled ~= bb then bb:free() end
             bb = scaled
-            bw = target_w
-            bh = target_h
+            bw = bb:getWidth()
+            bh = bb:getHeight()
         end
     end
 
-    return {
-        {
-            width = bw,
-            height = bh,
-            caption = caption,
-            bb = bb,
-        }
+    local image_item = {
+        width = bw,
+        height = bh,
+        caption = caption,
+        bb = bb,
+        _raw_data = data,
     }
+
+    image_item.load_bb_func = function(highres)
+        if highres then
+            if not image_item.hi_bb then
+                image_item.hi_bb = RenderImage:renderImageData(data, #data, true)
+            end
+            return image_item.hi_bb
+        end
+        return image_item.bb
+    end
+
+    return { image_item }
 end
 
 function WikipediaZim:_extractIntroText(cleaned_html, raw_html)
@@ -1063,20 +1741,12 @@ function WikipediaZim:_extractIntroText(cleaned_html, raw_html)
     lead = lead:gsub('<div%s+[^>]-class="[^"]-thumb[^"]-"[^>]*>.-</div>', "")
 
     local paras = {}
-    for p in lead:gmatch("<p[%s>](.-)</p>") do
+    for p in lead:gmatch("<p[^>]*>(.-)</p>") do
         local text = p:gsub("<[^>]+>", "")
+        -- Strip any residual opening tag attributes or unclosed brackets
+        text = text:gsub("^[^<]*>", "")
         -- Decode entities
-        text = text:gsub("&nbsp;", " ")
-                   :gsub("&#160;", " ")
-                   :gsub("&quot;", '"')
-                   :gsub("&amp;", "&")
-                   :gsub("&lt;", "<")
-                   :gsub("&gt;", ">")
-                   :gsub("&#39;", "'")
-                   :gsub("&ndash;", "–")
-                   :gsub("&mdash;", "—")
-                   :gsub("&#x2013;", "–")
-                   :gsub("&#x2014;", "—")
+        text = decode_html_entities(text)
         -- Remove citations/footnotes [1], [2], [citation needed]
         text = text:gsub("%[%s*%d+%s*%]", "")
         text = text:gsub("%[%s*%a%s*%]", "")
@@ -1090,20 +1760,17 @@ function WikipediaZim:_extractIntroText(cleaned_html, raw_html)
 
     if #paras == 0 then
         local plain = lead:gsub("<[^>]+>", " ")
-                          :gsub("&nbsp;", " ")
-                          :gsub("&quot;", '"')
-                          :gsub("&amp;", "&")
-                          :gsub("&lt;", "<")
-                          :gsub("&gt;", ">")
-                          :gsub("%s+", " ")
-                          :gsub("^%s+", "")
-                          :gsub("%s+$", "")
+        plain = decode_html_entities(plain)
+        plain = plain:gsub("%s+", " ")
+                     :gsub("^%s+", "")
+                     :gsub("%s+$", "")
         if #plain > 0 then
             paras[#paras + 1] = plain:sub(1, 1500)
         end
     end
 
     local intro = table.concat(paras, "\n\n")
+    intro = decode_html_entities(intro)
     if intro == "" then
         intro = _("No introduction.")
     end
@@ -1138,14 +1805,26 @@ function WikipediaZim:_loadArticleIntro(entry)
         return _("Article is not HTML."), nil
     end
     resolved._base = base
+    if self.library then
+        self.library.active_base = base
+    end
     local raw_html = html_or_err
-    local cleaned = HtmlClean.clean(raw_html)
-    if not cleaned or cleaned == "" then
-        cleaned = raw_html
+
+    -- Optimize dictionary popup intro extraction:
+    -- Find the lead boundary before first major section heading (h2 / mw-heading2 / section 1)
+    -- and clean ONLY the lead section rather than parsing and regexing the entire multi-megabyte article.
+    local h2 = raw_html:find("<h2[%s>]")
+        or raw_html:find('<div%s+[^>]*class="[^"]*mw%-heading2')
+        or raw_html:find('<section%s+[^>]*data%-mw%-section%-id="[1-9]')
+    local lead_raw = h2 and raw_html:sub(1, h2 - 1) or (raw_html:sub(1, 100000))
+
+    local cleaned_lead = HtmlClean.clean(lead_raw)
+    if not cleaned_lead or cleaned_lead == "" then
+        cleaned_lead = lead_raw
     end
 
-    local intro = self:_extractIntroText(cleaned, raw_html)
-    local images = self:_getLeadImageBlitBuffer(z, raw_html, cleaned, resolved.url or entry.url)
+    local intro = decode_html_entities(self:_extractIntroText(cleaned_lead, raw_html))
+    local images = self:_getLeadImageBlitBuffer(z, raw_html, cleaned_lead, resolved.url or entry.url)
 
     return intro, images, resolved
 end
@@ -1171,7 +1850,13 @@ function WikipediaZim:_loadArticleHtml(entry)
         return "<p><i>" .. _("Article is not HTML.") .. "</i></p>"
     end
     resolved._base = base
-    local cleaned = HtmlClean.clean(html_or_err)
+    if self.library then
+        self.library.active_base = base
+    end
+    local title_for_clean = (entry.title and entry.title ~= "") and entry.title or entry.url
+    local cleaned = HtmlClean.clean(html_or_err, true, title_for_clean, {
+        keep_references = G_reader_settings:isTrue("wikipediazim_show_references"),
+    })
     if not cleaned or cleaned == "" then
         cleaned = html_or_err
     end
@@ -1179,47 +1864,200 @@ function WikipediaZim:_loadArticleHtml(entry)
 end
 
 local DEFAULT_WIKI_CSS = [[
-    figure, .thumb, .thumbinner {
-        float: right;
-        clear: right;
-        margin: 0.4em 0 0.6em 0.8em;
-        padding: 3px;
-        border: 1px solid #c8ccd1;
-        background-color: #f8f9fa;
-        max-width: 48%;
+    header.mw-body-header, .vector-page-titlebar { margin: 0.2em 0 0.6em; }
+    h1.firstHeading, .mw-first-heading {
+        font-size: 1.45em; font-weight: normal; margin: 0.2em 0 0.15em;
+        padding-bottom: 0.2em; border-bottom: 1px solid #a2a9b1; color: #000;
+    }
+    .siteSub { font-size: 0.8em; color: #54595d; margin: 0 0 0.5em; font-style: italic; }
+    table.infobox {
+        border: 1px solid #a2a9b1 !important; border-spacing: 0 !important; border-collapse: collapse !important;
+        background-color: #f8f9fa !important; color: #202122 !important; margin: 0.8em auto 1.0em auto !important;
+        float: none !important; clear: both !important; width: 96% !important; max-width: 96% !important; font-size: 88%; line-height: 1.35;
+        box-sizing: border-box !important; border-radius: 4px;
+    }
+    table.infobox th, table.infobox td {
+        vertical-align: top; padding: 0.3em 0.4em; border: 1px solid #eaecf0; word-break: break-word;
+    }
+    table.infobox th { background-color: #f0f2f5; font-weight: bold; width: 35%; }
+    table.infobox td { width: 65%; }
+    table.infobox caption { font-weight: bold; font-size: 105%; padding: 0.3em; text-align: center; }
+    table.wikitable {
+        background-color: #f8f9fa; color: #202122; margin: 0.8em auto !important;
+        border: 1px solid #a2a9b1; border-collapse: collapse; font-size: 88%;
+        width: 98% !important; max-width: 100% !important; float: none !important; clear: both !important; word-break: break-word;
+    }
+    table.wikitable > tr > th, table.wikitable > * > tr > th {
+        background-color: #eaecf0; font-weight: bold; border: 1px solid #a2a9b1; padding: 0.3em 0.4em;
+    }
+    table.wikitable > tr > td, table.wikitable > * > tr > td {
+        border: 1px solid #a2a9b1; padding: 0.3em 0.4em; background-color: #ffffff;
+    }
+    table.sidebar { float: none !important; clear: both !important; margin: 0.8em auto !important; background: #f8f9fa; border: 1px solid #a2a9b1; padding: 0.3em; width: 96% !important; max-width: 96% !important; border-radius: 4px; }
+    .hatnote { font-style: italic; padding: 0.25em 0.5em; margin: 0.3em 0 0.6em; background-color: #fdfdfd; border-left: 3px solid #c8ccd1; font-size: 92%; }
+    ol.references { font-size: 85%; margin-left: 1.5em; }
+
+    figure, .thumb, .thumbinner, .pi-image {
+        margin: 0.8em auto !important;
+        padding: 0 !important;
+        border: none !important;
+        background: transparent !important;
+        max-width: 100% !important;
+        width: auto !important;
+        text-align: center !important;
+        display: block !important;
+        float: none !important;
+        clear: both !important;
         box-sizing: border-box;
-        display: block;
     }
-    figure.mw-halign-left, .tleft {
-        float: left;
-        clear: left;
-        margin: 0.4em 0.8em 0.6em 0;
-    }
+    figure.mw-halign-left, .tleft,
+    figure.mw-halign-right, .tright,
     figure.mw-halign-center, .tcenter, .tnone {
-        float: none;
-        clear: both;
-        margin: 0.5em auto;
-        display: block;
-        text-align: center;
+        float: none !important;
+        clear: both !important;
+        margin: 0.8em auto !important;
+        text-align: center !important;
     }
     img {
         max-width: 100% !important;
         height: auto !important;
+        display: inline-block !important;
+        vertical-align: middle !important;
+        margin: 0.4em auto !important;
+        border: none !important;
+    }
+    figure img, .thumb img, .thumbinner img, .pi-image img, figure > a > img, a.zim-img-zoom img {
+        max-width: 100% !important;
+        height: auto !important;
+        display: inline-block !important;
+        vertical-align: middle !important;
+        margin: 0 auto !important;
+        border: none !important;
+    }
+    a.zim-img-zoom {
+        text-decoration: none !important;
+        border: none !important;
+        display: inline-block !important;
+        vertical-align: middle !important;
+        margin: 0 auto !important;
+        padding: 0 !important;
+        background: transparent !important;
+    }
+    a.zim-img-zoom:link, a.zim-img-zoom:visited {
+        text-decoration: none !important;
+        border: none !important;
+        color: inherit !important;
+    }
+    figure a.zim-img-zoom, .thumb a.zim-img-zoom, .pi-image a.zim-img-zoom {
+        display: inline-block !important;
+        margin: 0 auto !important;
+        text-align: center !important;
+    }
+    figcaption, .thumbcaption {
+        font-size: 0.85em;
+        line-height: 1.3;
+        padding: 6px 8px 2px;
+        text-align: center;
+        color: #444;
         display: block;
         margin: 0 auto;
     }
-    figcaption, .thumbcaption {
-        font-size: 0.82em;
-        line-height: 1.25;
-        padding: 4px 2px 2px;
-        text-align: left;
-        color: #333;
-        display: block;
+
+    /* Fandom portable-infobox */
+    aside.portable-infobox {
+        display: block !important;
+        margin: 0.8em auto !important;
+        padding: 0.5em 0.8em !important;
+        border: 1px solid #c8ccd1 !important;
+        background-color: #f8f9fa !important;
+        max-width: 95% !important;
+        box-sizing: border-box;
+        border-radius: 4px;
+        float: none !important;
+        clear: both !important;
+    }
+    aside.portable-infobox figure,
+    aside.portable-infobox .pi-image {
+        margin: 0.4em auto !important;
+        text-align: center !important;
+        display: block !important;
+        border: none !important;
+        background: transparent !important;
+    }
+    aside.portable-infobox figure a.zim-img-zoom,
+    aside.portable-infobox .pi-image a.zim-img-zoom {
+        margin: 0 auto !important;
+        text-align: center !important;
+        display: inline-block !important;
+        border: none !important;
+        background: transparent !important;
+    }
+    aside.portable-infobox figure img,
+    aside.portable-infobox .pi-image img,
+    aside.portable-infobox figure a.zim-img-zoom img,
+    aside.portable-infobox .pi-image a.zim-img-zoom img {
+        display: inline-block !important;
+        vertical-align: middle !important;
+        margin: 0 auto !important;
+        max-width: 100% !important;
+        height: auto !important;
+    }
+    aside.portable-infobox .pi-title {
+        font-size: 1.15em !important;
+        font-weight: bold !important;
+        text-align: center !important;
+        margin: 0.2em 0 0.4em !important;
+        border-bottom: 1px solid #ccc !important;
+        padding-bottom: 0.2em !important;
+        display: block !important;
+    }
+    aside.portable-infobox .pi-header {
+        font-size: 1.0em !important;
+        font-weight: bold !important;
+        text-align: left !important;
+        background-color: #e2e5e8 !important;
+        padding: 0.25em 0.5em !important;
+        margin: 0.6em 0 0.3em !important;
+        border-radius: 2px;
+        display: block !important;
+    }
+    aside.portable-infobox .pi-data {
+        margin: 0.3em 0 !important;
+        text-align: left !important;
+        font-size: 0.92em !important;
+        line-height: 1.35 !important;
+        display: block !important;
+    }
+    aside.portable-infobox .pi-data-label {
+        font-weight: bold !important;
+        font-size: 0.95em !important;
+        display: inline !important;
+        text-align: left !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    aside.portable-infobox .pi-data-label::after {
+        content: ": ";
+    }
+    aside.portable-infobox .pi-data-value {
+        display: inline !important;
+        margin-left: 0.2em !important;
+        text-align: left !important;
+    }
+    aside.portable-infobox section.pi-group {
+        display: block !important;
+        margin: 0.4em 0 !important;
+        padding: 0 !important;
+        border: none !important;
+        text-align: left !important;
     }
     .mwe-math-fallback-image-inline {
         display: inline-block;
         vertical-align: middle;
         margin: 0 0.1em;
+    }
+    figure:empty {
+        display: none !important;
     }
 ]]
 
@@ -1240,7 +2078,7 @@ function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callb
             seen_targets[target_key] = true
 
             local title = (entry.title and entry.title ~= "") and entry.title or (entry.url and entry.url:gsub("_", " ")) or query
-            title = title:gsub("_", " ")
+            title = decode_html_entities(title:gsub("_", " "))
 
             local dict_name = _("Wikipedia (offline)")
             if multi then
@@ -1259,7 +2097,7 @@ function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callb
             }
 
             if entry.definition then
-                item.definition = entry.definition
+                item.definition = decode_html_entities(entry.definition)
                 item.images = entry.images
             elseif #dict_results == 0 then
                 -- Preload intro extract and lead image for first (best match) result immediately
@@ -1271,12 +2109,15 @@ function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callb
                 -- Lazy load intro extract and lead image for other matching articles on demand
                 setmetatable(item, {
                     __index = function(t, k)
-                        if k == "definition" or k == "images" then
+                        if k == "definition" then
                             local intro, images, resolved = self:_loadArticleIntro(entry)
-                            rawset(t, "definition", intro)
+                            rawset(t, "definition", intro or "")
                             rawset(t, "images", images)
                             if resolved then rawset(t, "zim_entry", resolved) end
-                            return rawget(t, k)
+                            return rawget(t, "definition")
+                        elseif k == "images" then
+                            -- Only return already-loaded images; do NOT trigger heavy article loading during image cleanup on window close
+                            return rawget(t, "images")
                         end
                         return nil
                     end,
@@ -1398,6 +2239,7 @@ function WikipediaZim:showResultsMenu(results, query)
     local menu_items = {}
     for _i, entry in ipairs(results) do
         local title = entry.title ~= "" and entry.title or entry.url
+        title = decode_html_entities(title:gsub("_", " "))
         if entry.kind == "redirect" then title = title .. " ⇒" end
         if multi then
             -- Show short ZIM tag when results span multiple ZIMs
@@ -1463,6 +2305,31 @@ function WikipediaZim:openEntry(entry, push_history)
         UIManager:show(InfoMessage:new{ text = _("Article not found.") })
         return
     end
+    resolved._base = base
+    if self.library then
+        self.library.active_base = base
+    end
+
+    if push_history and self.current_entry then
+        self.history[#self.history + 1] = self.current_entry
+    end
+    self.current_entry = resolved
+    self.current_title = resolved.title ~= "" and resolved.title or resolved.url
+    self.current_title = decode_html_entities(self.current_title:gsub("_", " "))
+
+    local cache_key = (base or "") .. ":" .. (resolved.url or entry.url or "")
+    if not self._article_lru then
+        self._article_lru = {}
+        self._article_lru_keys = {}
+    end
+    local cached = self._article_lru[cache_key]
+    if cached then
+        self.current_html = cached.html
+        self.current_title = cached.title or self.current_title
+        self:_showViewer()
+        return
+    end
+
     local ok, html_or_err, mime = pcall(function() return z:readArticle(resolved) end)
     if not ok then
         UIManager:show(InfoMessage:new{ text = tostring(html_or_err) })
@@ -1473,18 +2340,27 @@ function WikipediaZim:openEntry(entry, push_history)
         UIManager:show(InfoMessage:new{ text = _("Article is not HTML.") })
         return
     end
-    resolved._base = base
 
-    if push_history and self.current_entry then
-        self.history[#self.history + 1] = self.current_entry
-    end
-    self.current_entry = resolved
-    self.current_title = resolved.title ~= "" and resolved.title or resolved.url
-    local cleaned = HtmlClean.clean(html)
+    local t0 = os.clock()
+    local cleaned = HtmlClean.clean(html, true, self.current_title, {
+        keep_references = G_reader_settings:isTrue("wikipediazim_show_references"),
+    })
     if not cleaned or cleaned == "" then
         cleaned = html
     end
     self.current_html = self:_embedImagesInHtml(z, cleaned, resolved.url or entry.url)
+    logger.info(string.format("wikipediazim: cleaned %s in %.2f s (%d -> %d bytes)",
+        self.current_title, os.clock() - t0, #html, #self.current_html))
+
+    if #self._article_lru_keys >= 6 then
+        local oldest = table.remove(self._article_lru_keys, 1)
+        self._article_lru[oldest] = nil
+    end
+    self._article_lru_keys[#self._article_lru_keys + 1] = cache_key
+    self._article_lru[cache_key] = {
+        html = self.current_html,
+        title = self.current_title,
+    }
 
     self:_showViewer()
 end
@@ -1503,6 +2379,7 @@ end
 
 function WikipediaZim:_showViewer()
     if not self.current_html then return end
+    local t0 = os.clock()
     if self.current_viewer then
         UIManager:close(self.current_viewer)
         self.current_viewer = nil
@@ -1510,6 +2387,7 @@ function WikipediaZim:_showViewer()
     self.current_viewer = Viewer:new{
         title        = self.current_title or "",
         html         = self.current_html,
+        html_resource_directory = getTempImageDir(),
         font_size    = self.font_size,
         font_face    = self.font_face,
         line_spacing = self.line_spacing,
@@ -1522,6 +2400,8 @@ function WikipediaZim:_showViewer()
         on_settings = function(sz, face, spc, margin)   self:_applySettings(sz, face, spc, margin) end,
     }
     UIManager:show(self.current_viewer)
+    logger.info(string.format("wikipediazim: viewer shown in %.2f s (%s)",
+        os.clock() - t0, self.current_title or "?"))
 end
 
 function WikipediaZim:_goBack()
@@ -1533,10 +2413,38 @@ end
 
 function WikipediaZim:_followLink(href)
     if not href or href == "" then return end
+    if href:match("^zim%-img%-zoom:") or href:match("^zim%-image:") then
+        local filename = href:match("^zim%-img%-zoom:(.+)") or href:match("^zim%-image:(.+)")
+        if self.current_viewer and self.current_viewer.openImageViewer then
+            self.current_viewer:openImageViewer(filename)
+            return
+        end
+    end
+
     local hash = href:find("#", 1, true)
     if hash then href = href:sub(1, hash - 1) end
     if href == "" then return end
     href = href:gsub("^%./", "")
+
+    -- Check if link points directly to an image file
+    local img_ext = href:match("%.([%a%d]+)$")
+    if img_ext then
+        local ext_l = img_ext:lower()
+        if ext_l == "jpg" or ext_l == "jpeg" or ext_l == "png" or ext_l == "webp" or ext_l == "gif" or ext_l == "svg" then
+            local base = self.current_entry and self.current_entry._base
+            if base then
+                local z = self.library:open(base)
+                if z then
+                    local filename = self:_resolveImageFile(z, href) or self:_resolveImageFile(z, url_decode(href))
+                    if filename and self.current_viewer and self.current_viewer.openImageViewer then
+                        self.current_viewer:openImageViewer(filename)
+                        return
+                    end
+                end
+            end
+        end
+    end
+
     if href:match("^https?://") or href:match("^mailto:") then
         UIManager:show(InfoMessage:new{
             text = _("External link (offline):\n") .. href, timeout = 2,

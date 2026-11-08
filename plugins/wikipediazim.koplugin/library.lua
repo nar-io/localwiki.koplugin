@@ -114,12 +114,33 @@ function Library:closeAll()
     end
 end
 
+local function ordered_zims(self)
+    if not self.active_base or #self.zims <= 1 then
+        return self.zims
+    end
+    local ordered = {}
+    for _, e in ipairs(self.zims) do
+        if e.base == self.active_base then
+            ordered[#ordered + 1] = e
+            break
+        end
+    end
+    for _, e in ipairs(self.zims) do
+        if e.base ~= self.active_base then
+            ordered[#ordered + 1] = e
+        end
+    end
+    return ordered
+end
+
 -- Run a prefix search across every logical ZIM. Each result gets a `_base`
--- field tagging which ZIM it came from. Returns alpha-sorted by url, capped.
+-- field tagging which ZIM it came from.
+-- Active/current ZIM is queried first. Returns alpha-sorted by url, capped.
 function Library:prefixSearch(namespace, prefix, max_results)
     max_results = max_results or 60
     local out = {}
-    for _, e in ipairs(self.zims) do
+    local zims = ordered_zims(self)
+    for _, e in ipairs(zims) do
         local z, err = self:open(e.base)
         if z then
             local hits = z:prefixSearch(namespace, prefix, max_results)
@@ -139,9 +160,11 @@ function Library:prefixSearch(namespace, prefix, max_results)
 end
 
 -- Find exact matches across all logical ZIMs. Each result gets `_base` set.
+-- Active/current ZIM is queried first.
 function Library:findExact(namespace, target_url)
     local out = {}
-    for _, e in ipairs(self.zims) do
+    local zims = ordered_zims(self)
+    for _, e in ipairs(zims) do
         local z, err = self:open(e.base)
         if z then
             local hit = z:findExact(namespace, target_url)

@@ -113,7 +113,8 @@ function ZIM.open(path)
         main_page        = u32(h, 65),
         layout_page      = u32(h, 69),
         checksum_pos     = u64(h, 73),
-        cluster_cache    = Cluster.newCache(4),
+        cluster_cache    = Cluster.newCache(16),
+        _sparse_index    = nil,
     }, ZIM)
 
     -- MIME list: NUL-terminated strings, terminated by an empty string.
@@ -132,6 +133,9 @@ end
 function ZIM:close()
     if self.file then self.file:close(); self.file = nil end
     if self.cluster_cache then self.cluster_cache:clear() end
+    self._sparse_index = nil
+    self._url_index_cache = nil
+    self._url_index_cache_keys = nil
 end
 
 function ZIM:mimeOf(idx) return self.mimes[idx + 1] end
@@ -145,17 +149,19 @@ function ZIM:_direntOffset(article_idx)
 end
 
 -- Parse a directory entry at the given file offset. We always need the URL
--- (for binary search) and usually the title. Reads only as much as needed.
+-- (for binary search) and usually the title.
+-- Optimized: single buffered read (512B) parses header, url and title in memory,
+-- eliminating multi-seek disk churn on FAT32 flash storage.
 function ZIM:_readDirent(off, want_title)
     local f = self.file
     f:seek("set", off)
-    local head = f:read(16)
-    if not head or #head < 8 then return nil end
+    local buf = f:read(512)
+    if not buf or #buf < 8 then return nil end
 
-    local mime = u16(head, 1)
-    local param_len = head:byte(3)
-    local ns = string.char(head:byte(4))
-    local rev = u32(head, 5)
+    local mime = u16(buf, 1)
+    local param_len = buf:byte(3)
+    local ns = string.char(buf:byte(4))
+    local rev = u32(buf, 5)
 
     local entry = {
         offset    = off,
@@ -164,43 +170,86 @@ function ZIM:_readDirent(off, want_title)
         revision  = rev,
         param_len = param_len,
     }
-    local strings_off
+    local strings_buf_start
+    local strings_file_off
     if mime == 0xFFFF then
         entry.kind = "redirect"
-        entry.redirect_idx = u32(head, 9)
-        strings_off = off + 12
+        if #buf >= 12 then
+            entry.redirect_idx = u32(buf, 9)
+        end
+        strings_buf_start = 13
+        strings_file_off  = off + 12
     elseif mime == 0xFFFE or mime == 0xFFFD then
         entry.kind = "deleted"
-        strings_off = off + 8
+        strings_buf_start = 9
+        strings_file_off  = off + 8
     else
         entry.kind = "article"
-        entry.cluster = u32(head, 9)
-        entry.blob    = u32(head, 13)
-        strings_off = off + 16
+        if #buf >= 16 then
+            entry.cluster = u32(buf, 9)
+            entry.blob    = u32(buf, 13)
+        end
+        strings_buf_start = 17
+        strings_file_off  = off + 16
     end
 
-    f:seek("set", strings_off)
-    entry.url = read_cstring(f)
-    if want_title then
-        entry.title = read_cstring(f)
-        if entry.title == "" then entry.title = entry.url end
+    local nul1 = buf:find("\0", strings_buf_start, true)
+    if nul1 then
+        entry.url = buf:sub(strings_buf_start, nul1 - 1)
+        if want_title then
+            local title_start = nul1 + 1
+            local nul2 = buf:find("\0", title_start, true)
+            if nul2 then
+                entry.title = buf:sub(title_start, nul2 - 1)
+                if entry.title == "" then entry.title = entry.url end
+            else
+                -- Fallback if title exceeded the initial 512-byte buffer
+                f:seek("set", strings_file_off + #entry.url + 1)
+                entry.title = read_cstring(f)
+                if entry.title == "" then entry.title = entry.url end
+            end
+        end
+    else
+        -- Fallback if URL exceeded the initial 512-byte buffer
+        f:seek("set", strings_file_off)
+        entry.url = read_cstring(f)
+        if want_title then
+            entry.title = read_cstring(f)
+            if entry.title == "" then entry.title = entry.url end
+        end
     end
+
     return entry
 end
 
 -- Cheap URL-only fetch for the binary search inner loop.
+-- Optimized: single buffered read (256B) extracts namespace and URL in memory
+-- with 1 seek instead of 3 seeks + 2 reads + backwards seek.
 function ZIM:_readUrlAt(off)
     local f = self.file
     f:seek("set", off)
-    local head = f:read(4)
-    if not head then return nil, nil end
-    local mime = u16(head, 1)
-    local ns = string.char(head:byte(4))
-    local strings_off
-    if mime == 0xFFFF then strings_off = off + 12
-    elseif mime == 0xFFFE or mime == 0xFFFD then strings_off = off + 8
-    else strings_off = off + 16 end
-    f:seek("set", strings_off)
+    local buf = f:read(256)
+    if not buf or #buf < 8 then return nil, nil end
+
+    local mime = u16(buf, 1)
+    local ns = string.char(buf:byte(4))
+    local strings_buf_start
+    if mime == 0xFFFF then
+        strings_buf_start = 13
+    elseif mime == 0xFFFE or mime == 0xFFFD then
+        strings_buf_start = 9
+    else
+        strings_buf_start = 17
+    end
+
+    local nul = buf:find("\0", strings_buf_start, true)
+    if nul then
+        return ns, buf:sub(strings_buf_start, nul - 1)
+    end
+
+    -- Fallback for rare extra-long URLs
+    local strings_file_off = off + strings_buf_start - 1
+    f:seek("set", strings_file_off)
     return ns, read_cstring(f)
 end
 
@@ -210,26 +259,95 @@ function ZIM:getEntryByIndex(idx)
     return self:_readDirent(off, true)
 end
 
+-- Lazily builds a lightweight in-memory sparse index (256 anchors)
+-- to narrow binary search range by ~99% before doing any disk seeks.
+function ZIM:_ensureSparseIndex()
+    if self._sparse_index ~= nil then return self._sparse_index end
+    local count = self.article_count
+    if count < 512 then
+        self._sparse_index = false
+        return false
+    end
+    local num_anchors = 256
+    local step = count / (num_anchors + 1)
+    local anchors = {}
+    for i = 1, num_anchors do
+        local idx = math.floor(i * step)
+        local off = self:_direntOffset(idx)
+        local ns, url = self:_readUrlAt(off)
+        if ns and url then
+            anchors[#anchors + 1] = { idx = idx, key = ns .. url }
+        end
+    end
+    self._sparse_index = anchors
+    return self._sparse_index
+end
+
 -- Binary search returns (idx, exact_match). If not exact, idx is the
 -- insertion point — where prefix scanning should start.
+-- Optimized: uses in-memory MRU cache (64 entries) and sparse anchor index.
 function ZIM:findUrlIndex(namespace, target_url)
     local target_key = namespace .. target_url
+
+    if not self._url_index_cache then
+        self._url_index_cache = {}
+        self._url_index_cache_keys = {}
+    end
+    local cached = self._url_index_cache[target_key]
+    if cached ~= nil then
+        return cached.idx, cached.exact
+    end
+
     local lo, hi = 0, self.article_count - 1
+
+    local anchors = self:_ensureSparseIndex()
+    if anchors and #anchors > 0 then
+        local a_lo, a_hi = 1, #anchors
+        while a_lo <= a_hi do
+            local a_mid = math.floor((a_lo + a_hi) / 2)
+            local a = anchors[a_mid]
+            if a.key <= target_key then
+                lo = a.idx
+                a_lo = a_mid + 1
+            else
+                hi = a.idx
+                a_hi = a_mid - 1
+            end
+        end
+    end
+
+    local res_idx, res_exact = lo, false
     while lo <= hi do
         local mid = math.floor((lo + hi) / 2)
         local off = self:_direntOffset(mid)
         local ns, url = self:_readUrlAt(off)
-        if not ns then return lo, false end
+        if not ns then
+            res_idx, res_exact = lo, false
+            break
+        end
         local key = ns .. url
         if key == target_key then
-            return mid, true
+            res_idx, res_exact = mid, true
+            break
         elseif key < target_key then
             lo = mid + 1
         else
             hi = mid - 1
         end
     end
-    return lo, false
+
+    if not res_exact then
+        res_idx = lo
+    end
+
+    if #self._url_index_cache_keys >= 64 then
+        local oldest = table.remove(self._url_index_cache_keys, 1)
+        self._url_index_cache[oldest] = nil
+    end
+    self._url_index_cache_keys[#self._url_index_cache_keys + 1] = target_key
+    self._url_index_cache[target_key] = { idx = res_idx, exact = res_exact }
+
+    return res_idx, res_exact
 end
 
 -- Exact match lookup using binary search. Returns directory entry or nil.
@@ -246,21 +364,49 @@ end
 
 -- Walk forward from the insertion point collecting entries whose namespace
 -- matches and whose url starts with the prefix. Stops at the first miss.
+-- Optimized: batches pointer offsets and uses single-pass _readDirent,
+-- avoiding duplicate reads of the exact same dirent offset.
 function ZIM:prefixSearch(namespace, prefix, max_results)
     max_results = max_results or 50
     local idx = select(1, self:findUrlIndex(namespace, prefix))
     local results = {}
     local plen = #prefix
+    local f = self.file
+
     while #results < max_results and idx < self.article_count do
-        local off = self:_direntOffset(idx)
-        local ns, url = self:_readUrlAt(off)
-        if ns ~= namespace then break end
-        if url:sub(1, plen) ~= prefix then break end
-        local entry = self:_readDirent(off, true)
-        if entry and entry.kind ~= "deleted" then
-            results[#results + 1] = entry
+        local batch_size = math.min(32, self.article_count - idx)
+        f:seek("set", self.url_ptr_pos + idx * 8)
+        local ptr_buf = f:read(batch_size * 8)
+        if not ptr_buf or #ptr_buf < 8 then break end
+        local available = math.floor(#ptr_buf / 8)
+
+        local done = false
+        for b = 0, available - 1 do
+            local off = u64(ptr_buf, b * 8 + 1)
+            local entry = self:_readDirent(off, true)
+            if not entry then
+                done = true
+                break
+            end
+            if entry.namespace ~= namespace then
+                done = true
+                break
+            end
+            if entry.url:sub(1, plen) ~= prefix then
+                done = true
+                break
+            end
+            if entry.kind ~= "deleted" then
+                results[#results + 1] = entry
+                if #results >= max_results then
+                    done = true
+                    break
+                end
+            end
+            idx = idx + 1
         end
-        idx = idx + 1
+
+        if done then break end
     end
     return results
 end
