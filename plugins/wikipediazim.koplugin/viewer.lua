@@ -8,6 +8,7 @@ Top right 'X' closes the reader.
 
 local Blitbuffer      = require("ffi/blitbuffer")
 local Button          = require("ui/widget/button")
+local ButtonTable     = require("ui/widget/buttontable")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device          = require("device")
 local Font            = require("ui/font")
@@ -42,6 +43,12 @@ local CSS_GENERIC = {
 }
 
 local FONT_SIZES = { 14,16,18,20,22,24,26,28,30,32,36,40,46,52,60,72,84,96 }
+
+-- ── Constants ─────────────────────────────────────────────────────────────────
+
+local TOOLBAR_BOTTOM = Screen:scaleBySize(8)   -- breathing room under A-/A+
+local V_PAD          = Screen:scaleBySize(2)
+local H_PAD          = Screen:scaleBySize(2)
 
 local Viewer = InputContainer:extend{
     title        = "",
@@ -638,118 +645,68 @@ function Viewer:init()
     -- Row 1: [Back]  [Home]  [Search]   (Back only when history exists)
     local row1 = {}
     if self.can_go_back then
-        row1[#row1 + 1] = Button:new{
+        row1[#row1 + 1] = {
             text     = _("Back"),
-            padding  = btn_pad,
             callback = function()
                 if self.on_back then self.on_back() end
             end,
         }
     end
-    row1[#row1 + 1] = Button:new{
+    row1[#row1 + 1] = {
         text     = _("Home"),
-        padding  = btn_pad,
         callback = function()
             if self.on_home then self.on_home() end
         end,
     }
-    row1[#row1 + 1] = Button:new{
+    row1[#row1 + 1] = {
         text     = _("Search"),
-        padding  = btn_pad,
         callback = function()
             if self.on_search then self.on_search() end
         end,
     }
 
-    -- Toolbar: all buttons on a single row at the bottom.
+    -- Row 2: [A-]  [A+]
     local function notify(sz, face, spc, margin)
         if self.on_settings then self.on_settings(sz, face, spc, margin) end
     end
 
     local row2 = {
-        Button:new{
+        {
             text     = "A-",
-            padding  = btn_pad,
             callback = function()
                 notify(prevFontSize(self.font_size), self.font_face, self.line_spacing, self.margin_em)
             end,
         },
-        Button:new{
+        {
             text     = "A+",
-            padding  = btn_pad,
             callback = function()
                 notify(nextFontSize(self.font_size), self.font_face, self.line_spacing, self.margin_em)
             end,
         },
-        Button:new{
-            text     = string.format("Aa %s", self.font_face or _("Default")),
-            padding  = btn_pad,
-            callback = function()
-                self:_showFontMenu(function(chosen_face)
-                    notify(self.font_size, chosen_face, self.line_spacing, self.margin_em)
-                end)
-            end,
-        },
-        Button:new{
-            text     = string.format("%.1f", self.line_spacing or 1.2),
-            padding  = btn_pad,
-            callback = function()
-                self:_showSpacingMenu(function(chosen_spc)
-                    notify(self.font_size, self.font_face, chosen_spc, self.margin_em)
-                end)
-            end,
-        },
-        Button:new{
-            text     = self.margin_em == 0 and _("Compact") or _("Normal"),
-            padding  = btn_pad,
-            callback = function()
-                local next_m = (self.margin_em == 0) and 0.8 or 0
-                notify(self.font_size, self.font_face, self.line_spacing, next_m)
-            end,
-        },
     }
 
-    local row_h = Screen:scaleBySize(34)
-    local all_buttons = {}
-    for _, b in ipairs(row1) do all_buttons[#all_buttons + 1] = b end
-    for _, b in ipairs(row2) do all_buttons[#all_buttons + 1] = b end
+    local toolbar = ButtonTable:new{
+        buttons     = { row1, row2 },
+        zero_sep    = true,
+        show_parent = self,
+    }
+    local toolbar_h = toolbar:getSize().h
 
-    -- Keep every button on one row: shrink the horizontal padding until the
-    -- row fits the screen width.
-    local function row_width(pad)
-        local total = 0
-        for i, b in ipairs(all_buttons) do
-            b.padding_h = pad
-            total = total + b:getSize().w
-            if i > 1 then total = total + pad end -- HorizontalGroup spacing
-        end
-        return total
-    end
-    local pad = Screen:scaleBySize(4)
-    while pad > 0 and row_width(pad) > W - Screen:scaleBySize(8) do
-        pad = pad - 1
-    end
-    row_width(pad)
-
-    local toolbar_items = {
-        CenterContainer:new{
-            dimen = Geom:new{ w = W, h = row_h },
-            HorizontalGroup:new{ align = "center", padding = pad, table.unpack(all_buttons) },
-        },
+    -- Center the toolbar across the screen and add bottom breathing room
+    -- so A-/A+ glyphs don't kiss the bottom edge.
+    local toolbar_centered = CenterContainer:new{
+        dimen = Geom:new{ w = W, h = toolbar_h },
+        toolbar,
+    }
+    local toolbar_block = FrameContainer:new{
+        bordersize     = 0,
+        padding        = 0,
+        padding_bottom = TOOLBAR_BOTTOM,
+        background     = Blitbuffer.COLOR_WHITE,
+        toolbar_centered,
     }
 
-    local toolbar_divider = LineWidget:new{
-        dimen      = Geom:new{ w = W, h = Size.line.thick },
-        background = Blitbuffer.COLOR_DARK_GRAY,
-    }
-    local toolbar_block = VerticalGroup:new{
-        toolbar_divider,
-        table.unpack(toolbar_items),
-    }
-    local toolbar_h = toolbar_block:getSize().h
-    local V_PAD = Screen:scaleBySize(4)
-    local H_PAD = Screen:scaleBySize(8)
-    local content_h = H - title_h - toolbar_h
+    local content_h = H - title_h - toolbar_h - TOOLBAR_BOTTOM
     local html_h = math.max(100, content_h - 2 * V_PAD)
 
     -- Layout metrics, used by main.lua to pre-layout the article in the
@@ -842,7 +799,7 @@ function Viewer:init()
                 padding_left   = H_PAD,
                 padding_right  = H_PAD,
                 padding_top    = V_PAD,
-                padding_bottom = V_PAD,
+                padding_bottom = 0,
                 html_widget,
             },
             toolbar_block,
