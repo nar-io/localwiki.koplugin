@@ -1520,27 +1520,53 @@ local function is_decorative_icon(src)
         or s:find("bullet") or s:find("portal") or s:find("edit") or s:find("magnify")
 end
 
+-- Removes every <div …>…</div> block whose opening tag matches
+-- `open_pattern`, counting nested <div>s so the matching closing tag is the
+-- one that gets cut.
+local function strip_div_blocks(html, open_pattern)
+    local out = {}
+    local pos = 1
+    while true do
+        local s, e = html:find(open_pattern, pos)
+        if not s then break end
+        out[#out + 1] = html:sub(pos, s - 1)
+        local depth, i = 1, e + 1
+        while depth > 0 do
+            local ns = html:find("<div", i, true)
+            local ne = html:find("</div>", i, true)
+            if not ne then i = #html + 1; break end
+            if ns and ns < ne then
+                depth, i = depth + 1, ns + 4
+            else
+                depth, i = depth - 1, ne + 6
+            end
+        end
+        pos = i
+    end
+    out[#out + 1] = html:sub(pos)
+    return table.concat(out)
+end
+
 function WikipediaZim:_embedImagesInHtml(z, html, article_url)
     if not html or html == "" then return html end
 
     local BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
     local show_image = G_reader_settings:nilOrTrue("wikipediazim_show_images")
     if not show_image then
-        -- Image display disabled: nothing to extract. Blank the sources with a
-        -- single tag walk instead of two whole-document gsubs, and skip the
-        -- caption/lead-image passes below entirely.
-        if not html:find("<img", 1, true) then return html end
-        return (html:gsub('<img[^>]*>', function(tag)
-            -- Match the src value with a plain scan rather than a pattern:
-            -- image paths can contain quotes, which would break a lazy %2 match.
-            local s = tag:find("src=", 1, true)
-            if not s then return tag end
-            local q = tag:sub(s + 4, s + 4)
-            if q ~= '"' and q ~= "'" then return tag end
-            local e = tag:find(q, s + 5, true)
-            if not e then return tag end
-            return tag:sub(1, s + 3) .. q .. BLANK_GIF .. tag:sub(e)
-        end))
+        -- Images off: drop the pictures *and* the text that describes them.
+        -- Blanking only the source leaves the <img> width/height attributes in
+        -- place (a hole in the text) and keeps the caption (a stray sentence),
+        -- so the whole block goes: figure, legacy thumb, and the image row
+        -- normalize_infobox() builds for the infobox.
+        if not html:find("<img", 1, true) and not html:find("<figure", 1, true) then
+            return html
+        end
+        local r = html
+        r = r:gsub("<figure[^>]*>.-</figure>", "")
+        r = strip_div_blocks(r, '<div[^>]-class="[^"]-thumb[^"]-"')
+        r = r:gsub('<tr><td colspan="2" class="wz%-ib%-images">.-</td></tr>', "")
+        r = r:gsub("<img[^>]*>", "")
+        return r
     end
 
     local max_images = 6
@@ -1684,8 +1710,9 @@ end
 
 function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article_url)
     if not z then return nil end
-    local show_image = G_reader_settings:nilOrTrue("wikipediazim_show_images")
-    if not show_image then return nil end
+    -- Deliberately not tied to the "Show images in articles" setting: that
+    -- switch is about the article view. The lookup popup is a single small
+    -- picture that helps identify the article, and it stays either way.
 
     local src, caption = self:_findLeadImageSrc(raw_html, article_url, z)
     if not src and cleaned_html then
