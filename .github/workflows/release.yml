@@ -1,0 +1,51 @@
+name: release
+
+# Builds localwiki.koplugin.zip and attaches it to a GitHub release when a
+# version tag is pushed. The README tells users to download that zip, so the
+# archive must exist for install instructions to work.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify _meta.lua version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          meta=$(grep -oP 'version\s*=\s*"\K[^"]+' plugins/localwiki.koplugin/_meta.lua)
+          echo "tag=$tag meta=$meta"
+          if [ "$tag" != "$meta" ]; then
+            echo "::error::tag $tag does not match _meta.lua version $meta"
+            exit 1
+          fi
+
+      - name: Run unit tests
+        run: python3 -m unittest tests.test_offline_wikipedia
+
+      - name: Build plugin archive
+        run: |
+          set -euo pipefail
+          cd plugins
+          zip -r ../localwiki.koplugin.zip localwiki.koplugin \
+            -x '*.DS_Store' -x '__pycache__/*'
+          cd ..
+          unzip -l localwiki.koplugin.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: localwiki.koplugin.zip
+          generate_release_notes: true

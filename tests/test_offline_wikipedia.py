@@ -1,10 +1,10 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Comprehensive automated test suite for KOReader Offline Wikipedia integration.
 Tests:
 1. Static analysis and syntax verification of Lua files
 2. UTF-8 multi-byte character extraction and safe truncation
-3. Turkish Unicode character handling (I, Ä°, Ä±, i, and Ã§, ÄŸ, Ã¶, ÅŸ, Ã¼)
+3. Turkish Unicode character handling (I, İ, ı, i, and ç, ğ, ö, ş, ü)
 4. Multiword phrase title normalization and candidate generation
 5. Empty and whitespace-only selection rejection
 6. Excessively long selection handling without crashing
@@ -146,7 +146,7 @@ def utf8_truncate(s: str, max_len: int) -> str:
 
 
 def get_search_candidates(query: str) -> list[str]:
-    """Matches Lua WikipediaZim:_getSearchCandidates."""
+    """Matches Lua LocalWiki:_getSearchCandidates."""
     candidates = []
     seen = set()
 
@@ -166,26 +166,26 @@ def get_search_candidates(query: str) -> list[str]:
 
     uppers = []
     if first_char == "i":
-        uppers.append("\u0130")  # Turkish 'Ä°'
+        uppers.append("\u0130")  # Turkish 'İ'
         uppers.append("I")       # Standard 'I'
-    elif first_char == "\u0131":  # Turkish 'Ä±'
+    elif first_char == "\u0131":  # Turkish 'ı'
         uppers.append("I")
-    elif first_char == "\u0130":  # 'Ä°'
+    elif first_char == "\u0130":  # 'İ'
         uppers.append("\u0130")
         uppers.append("I")
     elif first_char == "I":
         uppers.append("I")
         uppers.append("\u0130")
-    elif first_char == "Ã§":
-        uppers.append("Ã‡")
-    elif first_char == "ÄŸ":
-        uppers.append("Ä")
-    elif first_char == "Ã¶":
-        uppers.append("Ã–")
-    elif first_char == "ÅŸ":
-        uppers.append("Å")
-    elif first_char == "Ã¼":
-        uppers.append("Ãœ")
+    elif first_char == "ç":
+        uppers.append("Ç")
+    elif first_char == "ğ":
+        uppers.append("Ğ")
+    elif first_char == "ö":
+        uppers.append("Ö")
+    elif first_char == "ş":
+        uppers.append("Ş")
+    elif first_char == "ü":
+        uppers.append("Ü")
     elif len(first_char) == 1 and "a" <= first_char <= "z":
         uppers.append(first_char.upper())
     else:
@@ -203,16 +203,16 @@ def get_search_candidates(query: str) -> list[str]:
             w_up = w_first
             if w_first in ("i", "\u0131"):
                 w_up = "I"
-            elif w_first == "Ã§":
-                w_up = "Ã‡"
-            elif w_first == "ÄŸ":
-                w_up = "Ä"
-            elif w_first == "Ã¶":
-                w_up = "Ã–"
-            elif w_first == "ÅŸ":
-                w_up = "Å"
-            elif w_first == "Ã¼":
-                w_up = "Ãœ"
+            elif w_first == "ç":
+                w_up = "Ç"
+            elif w_first == "ğ":
+                w_up = "Ğ"
+            elif w_first == "ö":
+                w_up = "Ö"
+            elif w_first == "ş":
+                w_up = "Ş"
+            elif w_first == "ü":
+                w_up = "Ü"
             elif len(w_first) == 1 and "a" <= w_first <= "z":
                 w_up = w_first.upper()
             words.append(w_up + w_rest)
@@ -230,16 +230,16 @@ def get_search_candidates(query: str) -> list[str]:
             elif w_first == "\u0131":
                 w_up = "I"
                 has_tr = True
-            elif w_first == "Ã§":
-                w_up = "Ã‡"
-            elif w_first == "ÄŸ":
-                w_up = "Ä"
-            elif w_first == "Ã¶":
-                w_up = "Ã–"
-            elif w_first == "ÅŸ":
-                w_up = "Å"
-            elif w_first == "Ã¼":
-                w_up = "Ãœ"
+            elif w_first == "ç":
+                w_up = "Ç"
+            elif w_first == "ğ":
+                w_up = "Ğ"
+            elif w_first == "ö":
+                w_up = "Ö"
+            elif w_first == "ş":
+                w_up = "Ş"
+            elif w_first == "ü":
+                w_up = "Ü"
             elif len(w_first) == 1 and "a" <= w_first <= "z":
                 w_up = w_first.upper()
             tr_words.append(w_up + w_rest)
@@ -278,39 +278,39 @@ class TestQueryProcessingAndUnicode(unittest.TestCase):
         self.assertEqual(get_search_candidates("\t\n  \r\n"), [])
 
     def test_turkish_i_capitalization(self):
-        # 'istanbul' -> must generate both 'Ä°stanbul' (trwiki) and 'Istanbul' (enwiki)
+        # 'istanbul' -> must generate both 'İstanbul' (trwiki) and 'Istanbul' (enwiki)
         cands = get_search_candidates("istanbul")
-        self.assertIn("Ä°stanbul", cands, "Turkish dotted Ä° variant must be present")
+        self.assertIn("İstanbul", cands, "Turkish dotted İ variant must be present")
         self.assertIn("Istanbul", cands, "Standard capital I variant must be present")
-        self.assertEqual(cands[0], "Ä°stanbul", "Turkish variant preferred first")
+        self.assertEqual(cands[0], "İstanbul", "Turkish variant preferred first")
 
     def test_turkish_dotless_i_capitalization(self):
-        # 'Ä±sparta' -> 'Isparta'
-        cands = get_search_candidates("Ä±sparta")
+        # 'ısparta' -> 'Isparta'
+        cands = get_search_candidates("ısparta")
         self.assertIn("Isparta", cands)
 
     def test_turkish_dotted_I_input(self):
-        # 'Ä°zmir' -> 'Ä°zmir' and 'Izmir'
-        cands = get_search_candidates("Ä°zmir")
-        self.assertIn("Ä°zmir", cands)
+        # 'İzmir' -> 'İzmir' and 'Izmir'
+        cands = get_search_candidates("İzmir")
+        self.assertIn("İzmir", cands)
         self.assertIn("Izmir", cands)
 
     def test_turkish_special_letters(self):
-        # Ã§, ÄŸ, Ã¶, ÅŸ, Ã¼
-        self.assertIn("Ã‡ocuk", get_search_candidates("Ã§ocuk"))
-        self.assertIn("Ä...", get_search_candidates("ÄŸ..."))
-        self.assertIn("Ã–ÄŸrenci", get_search_candidates("Ã¶ÄŸrenci"))
-        self.assertIn("Åair", get_search_candidates("ÅŸair"))
-        self.assertIn("Ãœlke", get_search_candidates("Ã¼lke"))
+        # ç, ğ, ö, ş, ü
+        self.assertIn("Çocuk", get_search_candidates("çocuk"))
+        self.assertIn("Ğ...", get_search_candidates("ğ..."))
+        self.assertIn("Öğrenci", get_search_candidates("öğrenci"))
+        self.assertIn("Şair", get_search_candidates("şair"))
+        self.assertIn("Ülke", get_search_candidates("ülke"))
 
     def test_turkish_multiword_selection(self):
-        cands = get_search_candidates("osmanlÄ± imparatorluÄŸu")
-        self.assertIn("OsmanlÄ±_imparatorluÄŸu", cands)
-        self.assertIn("OsmanlÄ±_Ä°mparatorluÄŸu", cands)
+        cands = get_search_candidates("osmanlı imparatorluğu")
+        self.assertIn("Osmanlı_imparatorluğu", cands)
+        self.assertIn("Osmanlı_İmparatorluğu", cands)
 
     def test_excessively_long_selection(self):
         # 1000 characters with multi-byte Turkish Unicode characters at boundary
-        long_text = ("Ä°stanbul " * 150)
+        long_text = ("İstanbul " * 150)
         truncated = utf8_truncate(long_text, 256)
         # Ensure byte length <= 256
         self.assertLessEqual(len(truncated.encode("utf-8")), 256)
@@ -461,8 +461,8 @@ class TestZimSearchSimulation(unittest.TestCase):
             {"url": "Quantum_mechanics", "title": "Quantum mechanics", "kind": "article"},
             {"url": "War", "title": "War", "kind": "article"},
             {"url": "War_and_Peace", "title": "War and Peace", "kind": "article"},
-            {"url": "Ä°zmir", "title": "Ä°zmir", "kind": "article"},
-            {"url": "Ä°stanbul", "title": "Ä°stanbul", "kind": "article"},
+            {"url": "İzmir", "title": "İzmir", "kind": "article"},
+            {"url": "İstanbul", "title": "İstanbul", "kind": "article"},
         ]
         cls.zim_bytes = create_synthetic_zim(cls.entries)
         cls.temp_dir = tempfile.TemporaryDirectory()
@@ -522,8 +522,8 @@ class TestZimSearchSimulation(unittest.TestCase):
         idx, exact = self._zim_binary_search("Computer")
         self.assertTrue(exact)
 
-        # Exact match for Turkish "Ä°stanbul"
-        idx, exact = self._zim_binary_search("Ä°stanbul")
+        # Exact match for Turkish "İstanbul"
+        idx, exact = self._zim_binary_search("İstanbul")
         self.assertTrue(exact)
 
         # Exact match for "Albert_Einstein"
@@ -567,17 +567,17 @@ class TestRealTurkishZim(unittest.TestCase):
             url_ptr_pos = struct.unpack_from("<Q", h, 32)[0]
             self.assertGreater(article_count, 1000)
 
-            # Test 1: Turkish lowercase 'i' -> 'Ä°' ("ivme" -> "Ä°vme")
+            # Test 1: Turkish lowercase 'i' -> 'İ' ("ivme" -> "İvme")
             cands = get_search_candidates("ivme")
-            self.assertIn("Ä°vme", cands)
+            self.assertIn("İvme", cands)
 
-            # Test 2: Turkish dotless 'Ä±' -> 'I' ("Ä±ÅŸÄ±k" -> "IÅŸÄ±k")
-            cands = get_search_candidates("Ä±ÅŸÄ±k")
-            self.assertIn("IÅŸÄ±k", cands)
+            # Test 2: Turkish dotless 'ı' -> 'I' ("ışık" -> "Işık")
+            cands = get_search_candidates("ışık")
+            self.assertIn("Işık", cands)
 
-            # Test 3: Multiword selection ("kuantum mekaniÄŸi" -> "Kuantum_mekaniÄŸi")
-            cands = get_search_candidates("kuantum mekaniÄŸi")
-            self.assertIn("Kuantum_mekaniÄŸi", cands)
+            # Test 3: Multiword selection ("kuantum mekaniği" -> "Kuantum_mekaniği")
+            cands = get_search_candidates("kuantum mekaniği")
+            self.assertIn("Kuantum_mekaniği", cands)
 
 
 class TestKOReaderIntegrationContract(unittest.TestCase):
@@ -598,12 +598,11 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
         self.assertIn("onReaderReady", content)
 
         # Public interface
-        self.assertIn("function WikipediaZim:searchFromSelection(", content)
-        self.assertIn("function WikipediaZim:onSearchOfflineWikipedia(text)", content)
-        self.assertIn("function WikipediaZim:_getSearchCandidates(query)", content)
-        self.assertIn("function WikipediaZim:showInLookupWindow(", content)
-        self.assertIn("function WikipediaZim:_loadArticleHtml(entry)", content)
-        self.assertIn("function WikipediaZim:onHtmlDictionaryLinkTapped(", content)
+        self.assertIn("function LocalWiki:searchFromSelection(", content)
+        self.assertIn("function LocalWiki:onSearchOfflineWikipedia(text)", content)
+        self.assertIn("function LocalWiki:_getSearchCandidates(query)", content)
+        self.assertIn("function LocalWiki:showInLookupWindow(", content)
+        self.assertIn("function LocalWiki:onHtmlDictionaryLinkTapped(", content)
 
     def test_lookup_window_contract(self):
         """Verify that searches open in KOReader's DictQuickLookup widget matching online Wikipedia."""
@@ -679,7 +678,7 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
             content = f.read()
         self.assertIn('_("Search articles")', content)
         self.assertIn('_("Open main page")', content)
-        self.assertIn('_("Set Wikipedia folderâ€¦")', content)
+        self.assertIn('_("Set Wikipedia folder…")', content)
 
 
 class TestWikipediaImageSupport(unittest.TestCase):
@@ -722,10 +721,10 @@ class TestWikipediaImageSupport(unittest.TestCase):
         self.assertIn("WebPDecodeRGBA", src)
 
         # Image blob resolver checking C, I, - namespaces and normalized paths
-        self.assertIn("function WikipediaZim:_resolveImageBlob(z, src)", src)
-        self.assertIn('ns = "C"', src)
-        self.assertIn('ns = "I"', src)
-        self.assertIn('ns = "-"', src)
+        self.assertIn("function LocalWiki:_resolveImageBlob(z, src)", src)
+        self.assertIn('add("C", v)', src)
+        self.assertIn('add("I", v)', src)
+        self.assertIn('add("-", v)', src)
         self.assertIn("image/jpeg", src)
         self.assertIn("image/png", src)
         self.assertIn("image/webp", src)
@@ -733,11 +732,11 @@ class TestWikipediaImageSupport(unittest.TestCase):
         self.assertIn("z._img_cache", src)
 
         # Lead image extraction from main page / index
-        self.assertIn("function WikipediaZim:_getLeadImageForArticle(z, article_url)", src)
+        self.assertIn("function LocalWiki:_getLeadImageForArticle(z, article_url)", src)
         self.assertIn("getMainPageEntry()", src)
 
         # Embed images as zoomable links or data URIs
-        self.assertIn("function WikipediaZim:_embedImagesInHtml(z, html, article_url)", src)
+        self.assertIn("function LocalWiki:_embedImagesInHtml(z, html, article_url)", src)
         self.assertTrue('safe_image_filename' in src or 'zim-img-zoom:' in src)
 
         # Inlining called in both popup lookup and full viewer
@@ -763,10 +762,10 @@ class TestWikipediaIntroAndInpageLookup(unittest.TestCase):
         with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
             src = f.read()
 
-        self.assertIn("function WikipediaZim:_findLeadImageSrc(html, article_url, z)", src)
-        self.assertIn("function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article_url)", src)
-        self.assertIn("function WikipediaZim:_extractIntroText(cleaned_html, raw_html)", src)
-        self.assertIn("function WikipediaZim:_loadArticleIntro(entry)", src)
+        self.assertIn("function LocalWiki:_findLeadImageSrc(html, article_url, z)", src)
+        self.assertIn("function LocalWiki:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article_url)", src)
+        self.assertIn("function LocalWiki:_extractIntroText(cleaned_html, raw_html, stop_at_heading, max_chars, max_paras)", src)
+        self.assertIn("function LocalWiki:_loadArticleIntro(entry)", src)
 
     def test_inpage_lookup_sets_is_html_false_and_is_wiki(self):
         with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
@@ -813,15 +812,18 @@ class TestWikipediaFullPageStylingAndStructure(unittest.TestCase):
         with open(os.path.join(PLUGIN_DIR, "htmlclean.lua"), "r", encoding="utf-8") as f:
             src = f.read()
 
-        self.assertIn("function M.clean(html, is_full_page, page_title)", src)
-        self.assertIn("function M.cleanFull(html, page_title)", src)
+        self.assertIn("function M.clean(html, is_full_page, page_title, opts)", src)
+        self.assertIn("function M.cleanFull(html, page_title, opts)", src)
         self.assertIn('<header class="mw-body-header vector-page-titlebar">', src)
         self.assertIn('<h1 id="firstHeading" class="firstHeading mw-first-heading">', src)
         self.assertIn('<div class="siteSub">', src)
 
-        # Full view preserves tables and hatnotes, while stripping navbox
+        # Full view preserves tables and hatnotes, while stripping navbox.
+        # navbox removal goes through the class table consumed by
+        # strip_class_blocks(), not a per-class Lua pattern.
         self.assertIn("is_full_page then", src)
-        self.assertIn('<table%s+[^>]-class="[^"]-navbox', src)
+        self.assertIn("navbox       = KEEP_NAVBOX", src)
+        self.assertIn("strip_class_blocks(html, block_classes)", src)
 
     def test_viewer_has_wikipedia_css_styling(self):
         with open(os.path.join(PLUGIN_DIR, "viewer.lua"), "r", encoding="utf-8") as f:
@@ -858,7 +860,7 @@ class TestWikipediaFullPageStylingAndStructure(unittest.TestCase):
         with open(os.path.join(PLUGIN_DIR, "main.lua"), "r", encoding="utf-8") as f:
             src = f.read()
 
-        self.assertIn("HtmlClean.clean(html, true, self.current_title)", src)
+        self.assertIn("HtmlClean.clean(html, true, self.current_title, {", src)
         self.assertIn("max_images = 6", src)
 
 

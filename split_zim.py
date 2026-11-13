@@ -4,25 +4,30 @@ FAT32-formatted Kindle storage. Output bytes concatenated equal the input
 byte-for-byte; the KOReader plugin reads them back as one virtual file.
 
 Usage:
-    python split_zim.py path\\to\\wikipedia_en_all_mini_2026-03.zim
-        [--chunk 3GB] [--out path\\to\\output_dir]
+    python split_zim.py path/to/wikipedia_en_all_mini_2026-03.zim
+        [--chunk 3GB] [--out path/to/output_dir]
 
-Defaults to 3 GiB chunks (well below the 4 GiB FAT32 limit).
+Defaults to 1 GiB chunks: small parts copy faster to slow e-ink storage and
+stay well below the 4 GiB FAT32 per-file limit.
 """
 
 from __future__ import annotations
-import argparse, os, sys, time
+import argparse, os, re, sys, time
 
 CHUNK_DEFAULT = 1 * 1024 ** 3   # 1 GiB — many small parts is fine, FAT32 caps at 4 GiB
 COPY_BUF      = 8 * 1024 ** 2   # 8 MiB streaming buffer
 
+_SIZE_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([KMGT]?)(?:I?B)?\s*$", re.IGNORECASE)
+_UNITS = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+
+
 def parse_size(s: str) -> int:
-    s = s.strip().upper()
-    if s.endswith("GB") or s.endswith("GIB"):
-        return int(float(s.rstrip("GIB").rstrip("B").rstrip("G")) * 1024**3)
-    if s.endswith("MB") or s.endswith("MIB"):
-        return int(float(s.rstrip("MIB").rstrip("B").rstrip("M")) * 1024**2)
-    return int(s)
+    """Parse '3500MB', '3GB', '1.5 GiB' or a plain byte count into bytes."""
+    m = _SIZE_RE.match(s)
+    if not m:
+        raise ValueError(f"cannot parse size: {s!r} (try 512MB, 3GB, 1.5GiB)")
+    value, unit = float(m.group(1)), m.group(2).upper()
+    return int(value * _UNITS[unit])
 
 def part_suffix(i: int) -> str:
     if i >= 26 * 26:
@@ -40,7 +45,7 @@ def split(src: str, chunk: int, out_dir: str | None) -> None:
         return
 
     print(f"Splitting {src} ({total/1024**3:.2f} GiB) "
-          f"into {chunk/1024**3:.2f} GiB parts -> {out_dir}\\{base}aa, {base}ab, …")
+          f"into {chunk/1024**3:.2f} GiB parts -> {os.path.join(out_dir, base)}aa, …")
 
     written = 0
     t0 = time.time()
@@ -74,7 +79,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("zim", help="path to the .zim file to split")
     ap.add_argument("--chunk", default="1GB",
-                    help="part size, e.g. 1GB, 3500MB. Default 1GB.")
+                    help="part size, e.g. 1GB, 3500MB (must be under 4 GiB). Default 1GB.")
     ap.add_argument("--out", default=None, help="output dir (default: same as input)")
     args = ap.parse_args()
     chunk = parse_size(args.chunk)

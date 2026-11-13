@@ -1,17 +1,17 @@
-﻿--[[
+--[[
 ZIM library: auto-discovers ZIM files (and split-set parts) in a folder,
 groups parts by base name into virtual ZIMs, and opens each lazily on first
 use. The rest of the plugin sees a flat list of "logical" ZIMs and never
 worries about whether a ZIM is on disk as one file or many parts.
 
-A "logical ZIM" is identified by its base name â€” e.g.
+A "logical ZIM" is identified by its base name — e.g.
   wikipedia_en_all_mini_2026-03.zim
 which on disk might be either:
   wikipedia_en_all_mini_2026-03.zim                  (single file < 4 GiB)
 or:
   wikipedia_en_all_mini_2026-03.zimaa                (split for FAT32)
   wikipedia_en_all_mini_2026-03.zimab
-  â€¦
+  …
 ZIM.open() handles both layouts transparently.
 ]]
 
@@ -25,7 +25,7 @@ Library.__index = Library
 function Library.new()
     return setmetatable({
         folder = nil,
-        zims = {},        -- array of { base, paths={â€¦}, zim=nil_until_opened }
+        zims = {},        -- array of { base, paths={…}, zim=nil_until_opened }
         by_base = {},     -- base_name -> entry (same table as in zims[])
     }, Library)
 end
@@ -77,10 +77,10 @@ function Library:scan(folder)
         self.by_base[base] = entry
     end
 
-    logger.info(string.format("localwiki: scanned %s â€” %d logical ZIM(s)",
+    logger.info(string.format("localwiki: scanned %s — %d logical ZIM(s)",
         folder, #self.zims))
     for _, e in ipairs(self.zims) do
-        logger.info(string.format("  %s â€” %d %s",
+        logger.info(string.format("  %s — %d %s",
             e.base, #e.paths, e.single and "file" or "parts"))
     end
     return #self.zims > 0
@@ -99,7 +99,7 @@ function Library:open(base)
     if not z then return nil, err end
     entry.zim = z
     logger.info(string.format(
-        "localwiki: opened %s (%s) â€” %d articles, %d clusters",
+        "localwiki: opened %s (%s) — %d articles, %d clusters",
         base, z.open_mode or "single", z.article_count, z.cluster_count))
     return z
 end
@@ -179,7 +179,7 @@ function Library:findExact(namespace, target_url)
     return out
 end
 
--- Number of *opened* (i.e. file-handle-active) ZIMs â€” for diagnostics.
+-- Number of *opened* (i.e. file-handle-active) ZIMs — for diagnostics.
 function Library:openedCount()
     local n = 0
     for _, e in ipairs(self.zims) do if e.zim then n = n + 1 end end

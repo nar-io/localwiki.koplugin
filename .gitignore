@@ -1,20 +1,11 @@
 # ZIM files (large — users download their own from kiwix.org)
+# *.zim?? covers the .zimaa/.zimab/… split parts in one rule.
 *.zim
 *.zim.*
-*.zimaa
-*.zimab
-*.zimac
-*.zimad
-*.zimae
-*.zimaf
-*.zimag
-*.zimah
-*.zimai
-*.zimaj
-*.zimak
-*.zimal
-*.zimam
 *.zim??
+
+# Release archives are built by the release workflow, not committed
+localwiki.koplugin.zip
 
 # Python
 __pycache__/

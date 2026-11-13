@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Test against real Turkish ZIM archive: wikipedia_tr_physics_nopic_2026-07.zim
+Exercise the search-candidate logic against a real ZIM archive.
+
+This is a manual tool, not part of the unit-test suite: it needs a real ZIM
+on disk. Pass the archive path as the first argument.
+
+    python3 tests/test_real_zim.py path/to/wiki.zim [query ...]
 """
 
 import os
@@ -9,7 +14,8 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from test_offline_wikipedia import get_search_candidates
 
-ZIM_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "wikipedia_tr_physics_nopic_2026-07.zim")
+DEFAULT_QUERIES = ["fizik", "ısı", "ışık", "ivme", "kuantum mekaniği",
+                   "albert einstein", "görelilik"]
 
 
 def read_cstring(f):
@@ -82,80 +88,48 @@ def find_url_index(f, url_ptr_pos, article_count, namespace, target_url):
     return lo, False
 
 
+def report(f, label, queries):
+    h = f.read(80)
+    article_count = struct.unpack_from("<I", h, 24)[0]
+    url_ptr_pos = struct.unpack_from("<Q", h, 32)[0]
+    print(f"\nLoaded {label}: {article_count} articles")
+
+    for q in queries:
+        cands = get_search_candidates(q)
+        print(f"\nQuery: '{q}' -> Candidates: {cands}")
+
+        exact_hits = []
+        for c in cands:
+            idx, exact = find_url_index(f, url_ptr_pos, article_count, "C", c)
+            if exact:
+                entry = read_dirent(f, dirent_offset(f, url_ptr_pos, idx))
+                exact_hits.append(entry)
+        print(f"  Exact matches: {[e['title'] for e in exact_hits]}")
+
+        prefix_hits = []
+        for c in cands:
+            idx, _ = find_url_index(f, url_ptr_pos, article_count, "C", c)
+            for i in range(idx, min(idx + 10, article_count)):
+                off = dirent_offset(f, url_ptr_pos, i)
+                ns, url = read_url_at(f, off)
+                if ns != "C" or not url.startswith(c):
+                    break
+                entry = read_dirent(f, off)
+                if entry["kind"] != "deleted" and entry["url"] not in [p["url"] for p in prefix_hits]:
+                    prefix_hits.append(entry)
+        print(f"  Prefix matches (first 5): {[e['title'] for e in prefix_hits[:5]]}")
+
+
 def main():
-    if not os.path.exists(ZIM_PATH):
-        print(f"Archive not found: {ZIM_PATH}")
-        return
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    zim_path = sys.argv[1]
+    if not os.path.exists(zim_path):
+        sys.exit(f"archive not found: {zim_path}")
+    queries = sys.argv[2:] or DEFAULT_QUERIES
 
-    with open(ZIM_PATH, "rb") as f:
-        h = f.read(80)
-        article_count = struct.unpack_from("<I", h, 24)[0]
-        url_ptr_pos = struct.unpack_from("<Q", h, 32)[0]
-        print(f"Loaded {os.path.basename(ZIM_PATH)}: {article_count} articles")
-
-        test_queries = [
-            "fizik",
-            "ısı",
-            "ışık",
-            "ivme",
-            "kuantum mekaniği",
-            "albert einstein",
-            "görelilik",
-        ]
-        for q in test_queries:
-            cands = get_search_candidates(q)
-            print(f"\nQuery: '{q}' -> Candidates: {cands}")
-
-            # Exact match check
-            exact_hits = []
-            for c in cands:
-                idx, exact = find_url_index(f, url_ptr_pos, article_count, "C", c)
-                if exact:
-                    entry = read_dirent(f, dirent_offset(f, url_ptr_pos, idx))
-                    exact_hits.append(entry)
-            exact_titles = [e["title"] for e in exact_hits]
-            print(f"  Exact matches: {exact_titles}")
-
-            # Prefix search check
-            prefix_hits = []
-            for c in cands:
-                idx, exact = find_url_index(f, url_ptr_pos, article_count, "C", c)
-                for i in range(idx, min(idx + 10, article_count)):
-                    off = dirent_offset(f, url_ptr_pos, i)
-                    ns, url = read_url_at(f, off)
-                    if ns != "C" or not url.startswith(c):
-                        break
-                    entry = read_dirent(f, off)
-                    if entry["kind"] != "deleted":
-                        if entry["url"] not in [p["url"] for p in prefix_hits]:
-                            prefix_hits.append(entry)
-            prefix_titles = [e["title"] for e in prefix_hits[:5]]
-            print(f"  Prefix matches (first 5): {prefix_titles}")
-
-    # Also test wikipedia_en_basketball_maxi_2026-09.zim if present
-    bball_zim = os.path.join(os.path.dirname(__file__), "..", "..", "wikipedia_en_basketball_maxi_2026-09.zim")
-    if os.path.exists(bball_zim):
-        with open(bball_zim, "rb") as bf:
-            bh = bf.read(80)
-            b_count = struct.unpack_from("<I", bh, 24)[0]
-            b_url_ptr = struct.unpack_from("<Q", bh, 32)[0]
-            print(f"\nLoaded {os.path.basename(bball_zim)}: {b_count} articles")
-
-            for q in ["Basketball", "Michael Jordan", "Stephen Curry", "Kobe Bryant"]:
-                cands = get_search_candidates(q)
-                exact_hits = []
-                for c in cands:
-                    idx, exact = find_url_index(bf, b_url_ptr, b_count, "C", c)
-                    if exact:
-                        entry = read_dirent(bf, dirent_offset(bf, b_url_ptr, idx))
-                        exact_hits.append(entry)
-                print(f"Query: '{q}' -> Exact hits: {[e['url'] for e in exact_hits]}")
-
-            # Test image resolution in basketball zim
-            sample_img = "_assets_/d1f33b1cb42dc60ec0e42c6954875701/James_Naismith_at_Springfield_College_circa_1920.jpg"
-            idx, exact = find_url_index(bf, b_url_ptr, b_count, "C", sample_img)
-            print(f"Sample image lookup ('{sample_img}'): exact={exact}, index={idx}")
-            assert exact, f"Failed to find {sample_img} in basketball ZIM!"
+    with open(zim_path, "rb") as f:
+        report(f, os.path.basename(zim_path), queries)
 
 
 if __name__ == "__main__":

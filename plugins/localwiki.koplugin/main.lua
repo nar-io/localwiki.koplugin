@@ -66,9 +66,11 @@ function LocalWiki:init()
     self.font_size    = G_reader_settings:readSetting(SETTING_FONT)    or _defaultFontSize()
     self.font_face    = G_reader_settings:readSetting(SETTING_FACE)    or _defaultFontFace()
     self.line_spacing = G_reader_settings:readSetting(SETTING_SPACING) or 1.2
-    -- margin_em is the "compact view" knob (no UI to set it yet) — always
-    -- start from the in-code default rather than a stale saved value.
-    self.margin_em    = 0
+    -- margin_em is the text inset (em units). It is persisted by
+    -- _applySettings(), so read it back instead of forcing the default on
+    -- every launch — otherwise a margin the reader picked is silently lost.
+    local saved_margin = G_reader_settings:readSetting(SETTING_MARGIN)
+    self.margin_em = (type(saved_margin) == "number" and saved_margin >= 0) and saved_margin or 0
 
     -- One-shot migration from the old single-file setting:
     --   <folder>/<file>.zim  -->  folder = <folder>
@@ -333,10 +335,16 @@ function LocalWiki:hookWikipediaModule()
                         return true
                     end
                 end
-                local prefix_hits = self.library:prefixSearch("C", query_to_url(word), 1)
-                if #prefix_hits > 0 then
-                    self:openEntry(prefix_hits[1], true)
-                    return true
+                -- Use the first candidate directly: query_to_url() is declared
+                -- further down the file, so a `local function` reference here
+                -- would still be nil when this closure is built.
+                local prefix_seed = cands[1]
+                if prefix_seed then
+                    local prefix_hits = self.library:prefixSearch("C", prefix_seed, 1)
+                    if #prefix_hits > 0 then
+                        self:openEntry(prefix_hits[1], true)
+                        return true
+                    end
                 end
             end
             self:searchFromSelection(word, boxes, dict_close_callback)
@@ -928,11 +936,6 @@ function LocalWiki:_getSearchCandidates(query)
     add(raw_url)
 
     return candidates
-end
-
-local function query_to_url(q)
-    local cands = LocalWiki._getSearchCandidates(nil, q)
-    return cands[1] or ""
 end
 
 local function url_decode(s)
@@ -1957,40 +1960,6 @@ function LocalWiki:_loadArticleIntro(entry)
     local images = self:_getLeadImageBlitBuffer(z, raw_html, cleaned_lead, resolved.url or entry.url)
 
     return intro, images, resolved
-end
-
-function LocalWiki:_loadArticleHtml(entry)
-    local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
-    if not base then
-        return "<p><i>" .. _("Article not found.") .. "</i></p>"
-    end
-    local z, err = self.library:open(base)
-    if not z then
-        return "<p><i>" .. tostring(err or _("Failed to open ZIM.")) .. "</i></p>"
-    end
-    local resolved = z:resolveRedirect(entry)
-    if not resolved or resolved.kind ~= "article" then
-        return "<p><i>" .. _("Article not found.") .. "</i></p>"
-    end
-    local ok, html_or_err, mime = pcall(function() return z:readArticle(resolved) end)
-    if not ok or not html_or_err then
-        return "<p><i>" .. tostring(html_or_err or _("Failed to read article.")) .. "</i></p>"
-    end
-    if not mime or not mime:match("^text/html") then
-        return "<p><i>" .. _("Article is not HTML.") .. "</i></p>"
-    end
-    resolved._base = base
-    if self.library then
-        self.library.active_base = base
-    end
-    local title_for_clean = (entry.title and entry.title ~= "") and entry.title or entry.url
-    local cleaned = HtmlClean.clean(html_or_err, true, title_for_clean, {
-        keep_references = G_reader_settings:isTrue("localwiki_show_references"),
-    })
-    if not cleaned or cleaned == "" then
-        cleaned = html_or_err
-    end
-    return self:_embedImagesInHtml(z, cleaned, resolved.url or entry.url)
 end
 
 local DEFAULT_WIKI_CSS = [[

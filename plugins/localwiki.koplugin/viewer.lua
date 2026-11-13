@@ -665,9 +665,13 @@ function Viewer:init()
         end,
     }
 
-    -- Row 2: [A-]  [A+]
+    -- Row 2: [A-]  [A+]  [Aa Font]  [Spacing]  [Margin]
     local function notify(sz, face, spc, margin)
         if self.on_settings then self.on_settings(sz, face, spc, margin) end
+    end
+
+    local function face_label()
+        return self.font_face or _("Font")
     end
 
     local row2 = {
@@ -681,6 +685,30 @@ function Viewer:init()
             text     = "A+",
             callback = function()
                 notify(nextFontSize(self.font_size), self.font_face, self.line_spacing, self.margin_em)
+            end,
+        },
+        {
+            text     = face_label(),
+            callback = function()
+                self:_showFontMenu(function(face)
+                    notify(self.font_size, face, self.line_spacing, self.margin_em)
+                end)
+            end,
+        },
+        {
+            text     = string.format(_("Spc %.1f"), self.line_spacing or 1.2),
+            callback = function()
+                self:_showSpacingMenu(function(spc)
+                    notify(self.font_size, self.font_face, spc, self.margin_em)
+                end)
+            end,
+        },
+        {
+            text     = string.format(_("Margin %.1f"), self.margin_em or 0),
+            callback = function()
+                self:_showMarginMenu(function(margin)
+                    notify(self.font_size, self.font_face, self.line_spacing, margin)
+                end)
             end,
         },
     }
@@ -708,14 +736,6 @@ function Viewer:init()
 
     local content_h = H - title_h - toolbar_h - TOOLBAR_BOTTOM
     local html_h = math.max(100, content_h - 2 * V_PAD)
-
-    -- Layout metrics, used by main.lua to pre-layout the article in the
-    -- background before the viewer is shown.
-    self.layout_metrics = {
-        width = W - 2 * H_PAD,
-        height = html_h,
-        font_size = self.font_size,
-    }
 
     local css = makeCss(self.font_face, self.line_spacing, self.margin_em)
 
@@ -1012,6 +1032,26 @@ function Viewer:_showSpacingMenu(callback)
     local m
     m = Menu:new{
         title       = _("Line spacing"),
+        item_table  = item_table,
+        onMenuClose = function() UIManager:close(m) end,
+    }
+    UIManager:show(m)
+end
+
+function Viewer:_showMarginMenu(callback)
+    local options = { 0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0 }
+    local item_table = {}
+    for _, margin in ipairs(options) do
+        item_table[#item_table + 1] = {
+            text      = string.format("%.1f em", margin),
+            checked   = (math.abs((self.margin_em or 0) - margin) < 0.05),
+            radio     = true,
+            callback  = function() callback(margin) end,
+        }
+    end
+    local m
+    m = Menu:new{
+        title       = _("Text margin"),
         item_table  = item_table,
         onMenuClose = function() UIManager:close(m) end,
     }
