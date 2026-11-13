@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Comprehensive automated test suite for KOReader Offline Wikipedia integration.
 Tests:
 1. Static analysis and syntax verification of Lua files
 2. UTF-8 multi-byte character extraction and safe truncation
-3. Turkish Unicode character handling (I, İ, ı, i, and ç, ğ, ö, ş, ü)
+3. Turkish Unicode character handling (I, Ä°, Ä±, i, and Ã§, ÄŸ, Ã¶, ÅŸ, Ã¼)
 4. Multiword phrase title normalization and candidate generation
 5. Empty and whitespace-only selection rejection
 6. Excessively long selection handling without crashing
@@ -26,7 +26,7 @@ import re
 
 # Paths
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-PLUGIN_DIR = os.path.join(BASE_DIR, "..", "plugins", "wikipediazim.koplugin")
+PLUGIN_DIR = os.path.join(BASE_DIR, "..", "plugins", "localwiki.koplugin")
 
 
 class TestLuaSyntaxAndIntegrity(unittest.TestCase):
@@ -166,26 +166,26 @@ def get_search_candidates(query: str) -> list[str]:
 
     uppers = []
     if first_char == "i":
-        uppers.append("\u0130")  # Turkish 'İ'
+        uppers.append("\u0130")  # Turkish 'Ä°'
         uppers.append("I")       # Standard 'I'
-    elif first_char == "\u0131":  # Turkish 'ı'
+    elif first_char == "\u0131":  # Turkish 'Ä±'
         uppers.append("I")
-    elif first_char == "\u0130":  # 'İ'
+    elif first_char == "\u0130":  # 'Ä°'
         uppers.append("\u0130")
         uppers.append("I")
     elif first_char == "I":
         uppers.append("I")
         uppers.append("\u0130")
-    elif first_char == "ç":
-        uppers.append("Ç")
-    elif first_char == "ğ":
-        uppers.append("Ğ")
-    elif first_char == "ö":
-        uppers.append("Ö")
-    elif first_char == "ş":
-        uppers.append("Ş")
-    elif first_char == "ü":
-        uppers.append("Ü")
+    elif first_char == "Ã§":
+        uppers.append("Ã‡")
+    elif first_char == "ÄŸ":
+        uppers.append("Ä")
+    elif first_char == "Ã¶":
+        uppers.append("Ã–")
+    elif first_char == "ÅŸ":
+        uppers.append("Å")
+    elif first_char == "Ã¼":
+        uppers.append("Ãœ")
     elif len(first_char) == 1 and "a" <= first_char <= "z":
         uppers.append(first_char.upper())
     else:
@@ -203,16 +203,16 @@ def get_search_candidates(query: str) -> list[str]:
             w_up = w_first
             if w_first in ("i", "\u0131"):
                 w_up = "I"
-            elif w_first == "ç":
-                w_up = "Ç"
-            elif w_first == "ğ":
-                w_up = "Ğ"
-            elif w_first == "ö":
-                w_up = "Ö"
-            elif w_first == "ş":
-                w_up = "Ş"
-            elif w_first == "ü":
-                w_up = "Ü"
+            elif w_first == "Ã§":
+                w_up = "Ã‡"
+            elif w_first == "ÄŸ":
+                w_up = "Ä"
+            elif w_first == "Ã¶":
+                w_up = "Ã–"
+            elif w_first == "ÅŸ":
+                w_up = "Å"
+            elif w_first == "Ã¼":
+                w_up = "Ãœ"
             elif len(w_first) == 1 and "a" <= w_first <= "z":
                 w_up = w_first.upper()
             words.append(w_up + w_rest)
@@ -230,16 +230,16 @@ def get_search_candidates(query: str) -> list[str]:
             elif w_first == "\u0131":
                 w_up = "I"
                 has_tr = True
-            elif w_first == "ç":
-                w_up = "Ç"
-            elif w_first == "ğ":
-                w_up = "Ğ"
-            elif w_first == "ö":
-                w_up = "Ö"
-            elif w_first == "ş":
-                w_up = "Ş"
-            elif w_first == "ü":
-                w_up = "Ü"
+            elif w_first == "Ã§":
+                w_up = "Ã‡"
+            elif w_first == "ÄŸ":
+                w_up = "Ä"
+            elif w_first == "Ã¶":
+                w_up = "Ã–"
+            elif w_first == "ÅŸ":
+                w_up = "Å"
+            elif w_first == "Ã¼":
+                w_up = "Ãœ"
             elif len(w_first) == 1 and "a" <= w_first <= "z":
                 w_up = w_first.upper()
             tr_words.append(w_up + w_rest)
@@ -278,39 +278,39 @@ class TestQueryProcessingAndUnicode(unittest.TestCase):
         self.assertEqual(get_search_candidates("\t\n  \r\n"), [])
 
     def test_turkish_i_capitalization(self):
-        # 'istanbul' -> must generate both 'İstanbul' (trwiki) and 'Istanbul' (enwiki)
+        # 'istanbul' -> must generate both 'Ä°stanbul' (trwiki) and 'Istanbul' (enwiki)
         cands = get_search_candidates("istanbul")
-        self.assertIn("İstanbul", cands, "Turkish dotted İ variant must be present")
+        self.assertIn("Ä°stanbul", cands, "Turkish dotted Ä° variant must be present")
         self.assertIn("Istanbul", cands, "Standard capital I variant must be present")
-        self.assertEqual(cands[0], "İstanbul", "Turkish variant preferred first")
+        self.assertEqual(cands[0], "Ä°stanbul", "Turkish variant preferred first")
 
     def test_turkish_dotless_i_capitalization(self):
-        # 'ısparta' -> 'Isparta'
-        cands = get_search_candidates("ısparta")
+        # 'Ä±sparta' -> 'Isparta'
+        cands = get_search_candidates("Ä±sparta")
         self.assertIn("Isparta", cands)
 
     def test_turkish_dotted_I_input(self):
-        # 'İzmir' -> 'İzmir' and 'Izmir'
-        cands = get_search_candidates("İzmir")
-        self.assertIn("İzmir", cands)
+        # 'Ä°zmir' -> 'Ä°zmir' and 'Izmir'
+        cands = get_search_candidates("Ä°zmir")
+        self.assertIn("Ä°zmir", cands)
         self.assertIn("Izmir", cands)
 
     def test_turkish_special_letters(self):
-        # ç, ğ, ö, ş, ü
-        self.assertIn("Çocuk", get_search_candidates("çocuk"))
-        self.assertIn("Ğ...", get_search_candidates("ğ..."))
-        self.assertIn("Öğrenci", get_search_candidates("öğrenci"))
-        self.assertIn("Şair", get_search_candidates("şair"))
-        self.assertIn("Ülke", get_search_candidates("ülke"))
+        # Ã§, ÄŸ, Ã¶, ÅŸ, Ã¼
+        self.assertIn("Ã‡ocuk", get_search_candidates("Ã§ocuk"))
+        self.assertIn("Ä...", get_search_candidates("ÄŸ..."))
+        self.assertIn("Ã–ÄŸrenci", get_search_candidates("Ã¶ÄŸrenci"))
+        self.assertIn("Åair", get_search_candidates("ÅŸair"))
+        self.assertIn("Ãœlke", get_search_candidates("Ã¼lke"))
 
     def test_turkish_multiword_selection(self):
-        cands = get_search_candidates("osmanlı imparatorluğu")
-        self.assertIn("Osmanlı_imparatorluğu", cands)
-        self.assertIn("Osmanlı_İmparatorluğu", cands)
+        cands = get_search_candidates("osmanlÄ± imparatorluÄŸu")
+        self.assertIn("OsmanlÄ±_imparatorluÄŸu", cands)
+        self.assertIn("OsmanlÄ±_Ä°mparatorluÄŸu", cands)
 
     def test_excessively_long_selection(self):
         # 1000 characters with multi-byte Turkish Unicode characters at boundary
-        long_text = ("İstanbul " * 150)
+        long_text = ("Ä°stanbul " * 150)
         truncated = utf8_truncate(long_text, 256)
         # Ensure byte length <= 256
         self.assertLessEqual(len(truncated.encode("utf-8")), 256)
@@ -461,8 +461,8 @@ class TestZimSearchSimulation(unittest.TestCase):
             {"url": "Quantum_mechanics", "title": "Quantum mechanics", "kind": "article"},
             {"url": "War", "title": "War", "kind": "article"},
             {"url": "War_and_Peace", "title": "War and Peace", "kind": "article"},
-            {"url": "İzmir", "title": "İzmir", "kind": "article"},
-            {"url": "İstanbul", "title": "İstanbul", "kind": "article"},
+            {"url": "Ä°zmir", "title": "Ä°zmir", "kind": "article"},
+            {"url": "Ä°stanbul", "title": "Ä°stanbul", "kind": "article"},
         ]
         cls.zim_bytes = create_synthetic_zim(cls.entries)
         cls.temp_dir = tempfile.TemporaryDirectory()
@@ -522,8 +522,8 @@ class TestZimSearchSimulation(unittest.TestCase):
         idx, exact = self._zim_binary_search("Computer")
         self.assertTrue(exact)
 
-        # Exact match for Turkish "İstanbul"
-        idx, exact = self._zim_binary_search("İstanbul")
+        # Exact match for Turkish "Ä°stanbul"
+        idx, exact = self._zim_binary_search("Ä°stanbul")
         self.assertTrue(exact)
 
         # Exact match for "Albert_Einstein"
@@ -567,17 +567,17 @@ class TestRealTurkishZim(unittest.TestCase):
             url_ptr_pos = struct.unpack_from("<Q", h, 32)[0]
             self.assertGreater(article_count, 1000)
 
-            # Test 1: Turkish lowercase 'i' -> 'İ' ("ivme" -> "İvme")
+            # Test 1: Turkish lowercase 'i' -> 'Ä°' ("ivme" -> "Ä°vme")
             cands = get_search_candidates("ivme")
-            self.assertIn("İvme", cands)
+            self.assertIn("Ä°vme", cands)
 
-            # Test 2: Turkish dotless 'ı' -> 'I' ("ışık" -> "Işık")
-            cands = get_search_candidates("ışık")
-            self.assertIn("Işık", cands)
+            # Test 2: Turkish dotless 'Ä±' -> 'I' ("Ä±ÅŸÄ±k" -> "IÅŸÄ±k")
+            cands = get_search_candidates("Ä±ÅŸÄ±k")
+            self.assertIn("IÅŸÄ±k", cands)
 
-            # Test 3: Multiword selection ("kuantum mekaniği" -> "Kuantum_mekaniği")
-            cands = get_search_candidates("kuantum mekaniği")
-            self.assertIn("Kuantum_mekaniği", cands)
+            # Test 3: Multiword selection ("kuantum mekaniÄŸi" -> "Kuantum_mekaniÄŸi")
+            cands = get_search_candidates("kuantum mekaniÄŸi")
+            self.assertIn("Kuantum_mekaniÄŸi", cands)
 
 
 class TestKOReaderIntegrationContract(unittest.TestCase):
@@ -679,7 +679,7 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
             content = f.read()
         self.assertIn('_("Search articles")', content)
         self.assertIn('_("Open main page")', content)
-        self.assertIn('_("Set Wikipedia folder…")', content)
+        self.assertIn('_("Set Wikipedia folderâ€¦")', content)
 
 
 class TestWikipediaImageSupport(unittest.TestCase):
@@ -864,6 +864,7 @@ class TestWikipediaFullPageStylingAndStructure(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

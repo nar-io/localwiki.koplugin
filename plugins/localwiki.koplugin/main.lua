@@ -28,11 +28,12 @@ local Library = require("library")
 local Viewer = require("viewer")
 local HtmlClean = require("htmlclean")
 
-local SETTING_FOLDER      = "wikipediazim_folder"
-local SETTING_FONT        = "wikipediazim_font_size"
-local SETTING_FACE        = "wikipediazim_font_face"
-local SETTING_SPACING     = "wikipediazim_line_spacing"
-local SETTING_MARGIN      = "wikipediazim_margin_em"
+local SETTING_FOLDER      = "localwiki_folder"
+local LEGACY_FOLDER_SETTING = "wikipediazim_folder"
+local SETTING_FONT        = "localwiki_font_size"
+local SETTING_FACE        = "localwiki_font_face"
+local SETTING_SPACING     = "localwiki_line_spacing"
+local SETTING_MARGIN      = "localwiki_margin_em"
 local LEGACY_PATH_SETTING = "wikipediazim_path"   -- old single-file setting
 
 local DEFAULT_FOLDER = "/mnt/us/wikipedia"
@@ -48,14 +49,14 @@ local function _defaultFontFace()
     return G_reader_settings:readSetting("copt_fontface")  -- may be nil
 end
 
-local WikipediaZim = WidgetContainer:extend{
-    name = "wikipediazim",
+local LocalWiki = WidgetContainer:extend{
+    name = "localwiki",
     is_doc_only = false,
 }
 
 -- ---------- init ----------
 
-function WikipediaZim:init()
+function LocalWiki:init()
     self.library     = Library.new()
     self.history     = {}
     self.last_search = nil
@@ -72,12 +73,16 @@ function WikipediaZim:init()
     -- One-shot migration from the old single-file setting:
     --   <folder>/<file>.zim  -->  folder = <folder>
     if not G_reader_settings:readSetting(SETTING_FOLDER) then
+        local legacy_f = G_reader_settings:readSetting(LEGACY_FOLDER_SETTING)
+        if legacy_f and legacy_f ~= "" then
+            G_reader_settings:saveSetting(SETTING_FOLDER, legacy_f)
+        end
         local legacy = G_reader_settings:readSetting(LEGACY_PATH_SETTING)
         if legacy and legacy ~= "" then
             local dir = legacy:match("^(.+)[/\\][^/\\]+$")
             if dir then
                 G_reader_settings:saveSetting(SETTING_FOLDER, dir)
-                logger.info("wikipediazim: migrated folder from legacy path -> " .. dir)
+                logger.info("localwiki: migrated folder from legacy path -> " .. dir)
             end
         end
     end
@@ -92,7 +97,7 @@ function WikipediaZim:init()
     end
 end
 
-function WikipediaZim:onReaderReady()
+function LocalWiki:onReaderReady()
     self:registerSelectionHooks()
 end
 
@@ -147,17 +152,17 @@ local function sanitizeDictButtonConfig()
     end
 end
 
-function WikipediaZim:patchDictQuickLookup()
-    if not ok_dict or not DictQuickLookup or DictQuickLookup._wikipediazim_patched then
+function LocalWiki:patchDictQuickLookup()
+    if not ok_dict or not DictQuickLookup or DictQuickLookup._localwiki_patched then
         return
     end
-    DictQuickLookup._wikipediazim_patched = true
+    DictQuickLookup._localwiki_patched = true
 
     -- Safeguard TextBoxWidget: if KOReader adjusts image.width/height for line layout,
     -- ensure image.bb is properly scaled so it never overflows past the right border or overlaps text.
     local ok_tbw, TextBoxWidget = pcall(require, "ui/widget/textboxwidget")
-    if ok_tbw and TextBoxWidget and not TextBoxWidget._wikipediazim_patched then
-        TextBoxWidget._wikipediazim_patched = true
+    if ok_tbw and TextBoxWidget and not TextBoxWidget._localwiki_patched then
+        TextBoxWidget._localwiki_patched = true
         local orig_renderImage = TextBoxWidget._renderImage
         TextBoxWidget._renderImage = function(tb_self, start_row_idx)
             if tb_self.line_num_to_image and tb_self.line_num_to_image[start_row_idx] then
@@ -222,7 +227,7 @@ function WikipediaZim:patchDictQuickLookup()
                     for j = #row, 1, -1 do
                         local btn = row[j]
                         if btn and btn.id == "wikipedia_offline" then
-                            if seen_offline or G_reader_settings:isTrue("wikipediazim_prefer_offline") then
+                            if seen_offline or G_reader_settings:isTrue("localwiki_prefer_offline") then
                                 table.remove(row, j)
                             else
                                 seen_offline = true
@@ -240,21 +245,21 @@ function WikipediaZim:patchDictQuickLookup()
     end
 end
 
-function WikipediaZim:registerSelectionHooks()
+function LocalWiki:registerSelectionHooks()
     self:addToHighlightDialog()
     self:registerDictButtons()
     self:hookWikipediaModule()
     self:patchDictQuickLookup()
 end
 
-function WikipediaZim:addToHighlightDialog()
+function LocalWiki:addToHighlightDialog()
     if not self.ui or not self.ui.highlight then return end
     self.ui.highlight:addToHighlightDialog("05_wikipedia_offline", function(this)
         return {
             id = "wikipedia_offline",
             text = _("Offline Wikipedia"),
             show_in_highlight_dialog_func = function()
-                return not G_reader_settings:isTrue("wikipediazim_prefer_offline")
+                return not G_reader_settings:isTrue("localwiki_prefer_offline")
             end,
             callback = function()
                 if this.hold_pos and not this.selected_text then
@@ -275,7 +280,7 @@ function WikipediaZim:addToHighlightDialog()
     end)
 end
 
-function WikipediaZim:registerDictButtons()
+function LocalWiki:registerDictButtons()
     if not self.ui or not self.ui.dictionary then return end
     sanitizeDictLayout(self.ui.dictionary)
     sanitizeDictButtonConfig()
@@ -290,7 +295,7 @@ function WikipediaZim:registerDictButtons()
             if dict_popup.is_offline_wiki or dict_popup.is_wiki then
                 return false
             end
-            if G_reader_settings:isTrue("wikipediazim_prefer_offline") then
+            if G_reader_settings:isTrue("localwiki_prefer_offline") then
                 return false
             end
             return true
@@ -312,13 +317,13 @@ function WikipediaZim:registerDictButtons()
     })
 end
 
-function WikipediaZim:hookWikipediaModule()
+function LocalWiki:hookWikipediaModule()
     if not self.ui or not self.ui.wikipedia then return end
     if self._wikipedia_hooked then return end
     self._wikipedia_hooked = true
     local orig_onLookupWikipedia = self.ui.wikipedia.onLookupWikipedia
     self.ui.wikipedia.onLookupWikipedia = function(wiki_self, word, is_sane, boxes, page, lang, dict_close_callback)
-        if (G_reader_settings:isTrue("wikipediazim_prefer_offline") or page) and self:_ensureScanned() then
+        if (G_reader_settings:isTrue("localwiki_prefer_offline") or page) and self:_ensureScanned() then
             if page then
                 local cands = self:_getSearchCandidates(word)
                 for _, cand in ipairs(cands) do
@@ -341,10 +346,10 @@ function WikipediaZim:hookWikipediaModule()
     end
 end
 
-function WikipediaZim:onDispatcherRegisterActions()
+function LocalWiki:onDispatcherRegisterActions()
     local ok_disp, Dispatcher = pcall(require, "dispatcher")
     if ok_disp and Dispatcher and Dispatcher.registerAction then
-        Dispatcher:registerAction("wikipediazim_search", {
+        Dispatcher:registerAction("localwiki_search", {
             category = "none",
             event = "SearchOfflineWikipedia",
             title = _("Search Offline Wikipedia"),
@@ -353,24 +358,24 @@ function WikipediaZim:onDispatcherRegisterActions()
     end
 end
 
-function WikipediaZim:onSearchOfflineWikipedia(text)
+function LocalWiki:onSearchOfflineWikipedia(text)
     self:searchFromSelection(text)
 end
 
-function WikipediaZim:_folder()
+function LocalWiki:_folder()
     return G_reader_settings:readSetting(SETTING_FOLDER) or DEFAULT_FOLDER
 end
 
 -- Lazy: only scans the folder the first time the user actually does anything.
 -- Returns true if at least one logical ZIM was found.
-function WikipediaZim:_ensureScanned()
+function LocalWiki:_ensureScanned()
     if self._scanned then return #self.library.zims > 0 end
     self._scanned = true
     self.library:scan(self:_folder())
     return #self.library.zims > 0
 end
 
-function WikipediaZim:_rescan()
+function LocalWiki:_rescan()
     self.library:closeAll()
     self.library = Library.new()
     self._scanned = false
@@ -385,7 +390,7 @@ local function getTempImageDir()
     else
         base = os.getenv("TEMP") or os.getenv("TMP") or "/tmp"
     end
-    local img_dir = base .. "/wikipediazim_img"
+    local img_dir = base .. "/localwiki_img"
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
     if not ok_lfs or not lfs then
         ok_lfs, lfs = pcall(require, "lfs")
@@ -444,10 +449,10 @@ local function safe_image_filename(src, mime)
     return string.format("%s_%08x%s", base, h, ext)
 end
 
-function WikipediaZim:onCloseDocument() self:_releaseAll() end
-function WikipediaZim:onSuspend()       self:_releaseAll() end
+function LocalWiki:onCloseDocument() self:_releaseAll() end
+function LocalWiki:onSuspend()       self:_releaseAll() end
 
-function WikipediaZim:_releaseAll()
+function LocalWiki:_releaseAll()
     self.library:closeAll()
     self.history = {}
     self.current_entry = nil
@@ -466,15 +471,15 @@ end
 
 -- ---------- menu ----------
 
-function WikipediaZim:addToMainMenu(menu_items)
-    menu_items.wikipediazim = {
+function LocalWiki:addToMainMenu(menu_items)
+    menu_items.localwiki = {
         text = _("Wikipedia (offline)"),
         sorting_hint = "more_tools",
         sub_item_table_func = function() return self:_buildSubMenu() end,
     }
 end
 
-function WikipediaZim:_buildSubMenu()
+function LocalWiki:_buildSubMenu()
     self:_ensureScanned()
     local items = {
         {
@@ -515,10 +520,10 @@ function WikipediaZim:_buildSubMenu()
         {
             text = _("Use for default 'Wikipedia' button"),
             checked_func = function()
-                return G_reader_settings:isTrue("wikipediazim_prefer_offline")
+                return G_reader_settings:isTrue("localwiki_prefer_offline")
             end,
             callback = function()
-                G_reader_settings:flipNilOrFalse("wikipediazim_prefer_offline")
+                G_reader_settings:flipNilOrFalse("localwiki_prefer_offline")
                 if self.ui and self.ui.dictionary then
                     sanitizeDictLayout(self.ui.dictionary)
                 end
@@ -528,10 +533,10 @@ function WikipediaZim:_buildSubMenu()
         {
             text = _("Show references (slower)"),
             checked_func = function()
-                return G_reader_settings:isTrue("wikipediazim_show_references")
+                return G_reader_settings:isTrue("localwiki_show_references")
             end,
             callback = function()
-                G_reader_settings:flipNilOrFalse("wikipediazim_show_references")
+                G_reader_settings:flipNilOrFalse("localwiki_show_references")
                 -- Cached HTML was cleaned with the previous setting.
                 self._article_lru = nil
                 self._article_lru_keys = nil
@@ -540,10 +545,10 @@ function WikipediaZim:_buildSubMenu()
         {
             text = _("Show images in articles"),
             checked_func = function()
-                return G_reader_settings:nilOrTrue("wikipediazim_show_images")
+                return G_reader_settings:nilOrTrue("localwiki_show_images")
             end,
             callback = function()
-                G_reader_settings:flipNilOrTrue("wikipediazim_show_images")
+                G_reader_settings:flipNilOrTrue("localwiki_show_images")
                 -- Cached HTML was built with the previous setting.
                 self._article_lru = nil
                 self._article_lru_keys = nil
@@ -557,7 +562,7 @@ function WikipediaZim:_buildSubMenu()
     return items
 end
 
-function WikipediaZim:showLoadedZims()
+function LocalWiki:showLoadedZims()
     self:_ensureScanned()
     if #self.library.zims == 0 then
         UIManager:show(InfoMessage:new{
@@ -585,7 +590,7 @@ function WikipediaZim:showLoadedZims()
     UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n\n") })
 end
 
-function WikipediaZim:chooseFolder()
+function LocalWiki:chooseFolder()
     local picker
     picker = PathChooser:new{
         title = _("Folder containing your ZIM file(s)"),
@@ -741,7 +746,7 @@ end
 
 -- Generate search candidate URLs supporting Unicode, Turkish characters,
 -- circumflex variants (\195\162 / \195\130), multiword phrases, and title-cased variants.
-function WikipediaZim:_getSearchCandidates(query)
+function LocalWiki:_getSearchCandidates(query)
     local candidates = {}
     local seen = {}
     local function add(c)
@@ -926,7 +931,7 @@ function WikipediaZim:_getSearchCandidates(query)
 end
 
 local function query_to_url(q)
-    local cands = WikipediaZim._getSearchCandidates(nil, q)
+    local cands = LocalWiki._getSearchCandidates(nil, q)
     return cands[1] or ""
 end
 
@@ -942,11 +947,11 @@ local function url_encode(s)
     end))
 end
 
-function WikipediaZim:recordSearchHistory(q)
+function LocalWiki:recordSearchHistory(q)
     if not q or q == "" then return end
     q = q:gsub("^%s+", ""):gsub("%s+$", "")
     if q == "" then return end
-    local history = G_reader_settings:readSetting("wikipediazim_search_history") or {}
+    local history = G_reader_settings:readSetting("localwiki_search_history") or {}
     for i = #history, 1, -1 do
         if history[i] == q then
             table.remove(history, i)
@@ -956,14 +961,14 @@ function WikipediaZim:recordSearchHistory(q)
     while #history > 15 do
         table.remove(history)
     end
-    G_reader_settings:saveSetting("wikipediazim_search_history", history)
+    G_reader_settings:saveSetting("localwiki_search_history", history)
 end
 
-function WikipediaZim:getSearchHistory()
-    return G_reader_settings:readSetting("wikipediazim_search_history") or {}
+function LocalWiki:getSearchHistory()
+    return G_reader_settings:readSetting("localwiki_search_history") or {}
 end
 
-function WikipediaZim:showSearchHistoryMenu(parent_dialog)
+function LocalWiki:showSearchHistoryMenu(parent_dialog)
     local history = self:getSearchHistory()
     if #history == 0 then
         UIManager:show(InfoMessage:new{
@@ -990,7 +995,7 @@ function WikipediaZim:showSearchHistoryMenu(parent_dialog)
         text = _("Clear history"),
         separator = true,
         callback = function()
-            G_reader_settings:saveSetting("wikipediazim_search_history", {})
+            G_reader_settings:saveSetting("localwiki_search_history", {})
             UIManager:show(InfoMessage:new{
                 text = _("Search history cleared."),
             })
@@ -1006,7 +1011,7 @@ function WikipediaZim:showSearchHistoryMenu(parent_dialog)
     UIManager:show(menu)
 end
 
-function WikipediaZim:openSearchDialog(initial_query, custom_title)
+function LocalWiki:openSearchDialog(initial_query, custom_title)
     if not self:_ensureScanned() then
         UIManager:show(InfoMessage:new{
             text = string.format(_("No ZIM files in:\n%s"), self:_folder()),
@@ -1040,7 +1045,7 @@ function WikipediaZim:openSearchDialog(initial_query, custom_title)
     dialog:onShowKeyboard()
 end
 
-function WikipediaZim:searchFromSelection(text, boxes, dict_close_callback)
+function LocalWiki:searchFromSelection(text, boxes, dict_close_callback)
     if type(text) ~= "string" then return end
     local ok_util, util = pcall(require, "util")
     if ok_util and util and util.cleanupSelectedText then
@@ -1058,7 +1063,7 @@ function WikipediaZim:searchFromSelection(text, boxes, dict_close_callback)
     self:runSearch(text, boxes, dict_close_callback)
 end
 
-function WikipediaZim:runSearch(query, boxes, dict_close_callback)
+function LocalWiki:runSearch(query, boxes, dict_close_callback)
     if not self:_ensureScanned() then
         UIManager:show(InfoMessage:new{
             text = string.format(_("No ZIM files in:\n%s"), self:_folder()),
@@ -1318,7 +1323,7 @@ local function convert_to_png(raw_data)
     return nil
 end
 
-function WikipediaZim:_resolveImageBlob(z, src)
+function LocalWiki:_resolveImageBlob(z, src)
     if not z or not src or src == "" then return nil end
     if src:match("^https?://") or src:match("^data:") then return nil end
 
@@ -1452,7 +1457,7 @@ function WikipediaZim:_resolveImageBlob(z, src)
     return nil
 end
 
-function WikipediaZim:_getLeadImageForArticle(z, article_url)
+function LocalWiki:_getLeadImageForArticle(z, article_url)
     if not z or not article_url or article_url == "" then return nil end
     if not z._lead_images then
         z._lead_images = {}
@@ -1475,7 +1480,7 @@ function WikipediaZim:_getLeadImageForArticle(z, article_url)
     return nil
 end
 
-function WikipediaZim:_resolveImageFile(z, src)
+function LocalWiki:_resolveImageFile(z, src)
     if not z or not src or src == "" then return nil end
     if src:match("^https?://") or src:match("^data:") then return nil end
 
@@ -1550,11 +1555,11 @@ local function strip_div_blocks(html, open_pattern)
     return table.concat(out)
 end
 
-function WikipediaZim:_embedImagesInHtml(z, html, article_url)
+function LocalWiki:_embedImagesInHtml(z, html, article_url)
     if not html or html == "" then return html end
 
     local BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
-    local show_image = G_reader_settings:nilOrTrue("wikipediazim_show_images")
+    local show_image = G_reader_settings:nilOrTrue("localwiki_show_images")
     if not show_image then
         -- Images off: drop the pictures *and* the text that describes them.
         -- Blanking only the source leaves the <img> width/height attributes in
@@ -1653,7 +1658,7 @@ function WikipediaZim:_embedImagesInHtml(z, html, article_url)
     return replaced_html
 end
 
-function WikipediaZim:_findLeadImageSrc(html, article_url, z)
+function LocalWiki:_findLeadImageSrc(html, article_url, z)
     if not html or html == "" then return nil end
 
     -- (1) Check infobox table
@@ -1711,7 +1716,7 @@ function WikipediaZim:_findLeadImageSrc(html, article_url, z)
     return nil
 end
 
-function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article_url)
+function LocalWiki:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article_url)
     if not z then return nil end
     -- Deliberately not tied to the "Show images in articles" setting: that
     -- switch is about the article view. The lookup popup is a single small
@@ -1818,7 +1823,7 @@ local function find_lead_end(html)
         or html:find('<section%s+[^>]*data%-mw%-section%-id="[1-9]')
 end
 
-function WikipediaZim:_extractIntroText(cleaned_html, raw_html, stop_at_heading, max_chars, max_paras)
+function LocalWiki:_extractIntroText(cleaned_html, raw_html, stop_at_heading, max_chars, max_paras)
     local html = cleaned_html or raw_html or ""
     if html == "" then return "" end
     max_chars = max_chars or 1800
@@ -1894,7 +1899,7 @@ function WikipediaZim:_extractIntroText(cleaned_html, raw_html, stop_at_heading,
     return intro
 end
 
-function WikipediaZim:_loadArticleIntro(entry)
+function LocalWiki:_loadArticleIntro(entry)
     local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
     if not base then
         return _("Article not found."), nil
@@ -1954,7 +1959,7 @@ function WikipediaZim:_loadArticleIntro(entry)
     return intro, images, resolved
 end
 
-function WikipediaZim:_loadArticleHtml(entry)
+function LocalWiki:_loadArticleHtml(entry)
     local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
     if not base then
         return "<p><i>" .. _("Article not found.") .. "</i></p>"
@@ -1980,7 +1985,7 @@ function WikipediaZim:_loadArticleHtml(entry)
     end
     local title_for_clean = (entry.title and entry.title ~= "") and entry.title or entry.url
     local cleaned = HtmlClean.clean(html_or_err, true, title_for_clean, {
-        keep_references = G_reader_settings:isTrue("wikipediazim_show_references"),
+        keep_references = G_reader_settings:isTrue("localwiki_show_references"),
     })
     if not cleaned or cleaned == "" then
         cleaned = html_or_err
@@ -2186,7 +2191,7 @@ local DEFAULT_WIKI_CSS = [[
     }
 ]]
 
-function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callback)
+function LocalWiki:showInLookupWindow(results, query, boxes, dict_close_callback)
     if not ok_dict or not DictQuickLookup then
         self:showResultsMenu(results, query)
         return
@@ -2327,7 +2332,7 @@ function WikipediaZim:showInLookupWindow(results, query, boxes, dict_close_callb
     UIManager:show(lookup_window)
 end
 
-function WikipediaZim:onHtmlDictionaryLinkTapped(dictionary, link)
+function LocalWiki:onHtmlDictionaryLinkTapped(dictionary, link)
     local href = type(link) == "table" and (link.uri or link.url) or link
     if not href or href == "" then return end
     local hash = href:find("#", 1, true)
@@ -2359,7 +2364,7 @@ function WikipediaZim:onHtmlDictionaryLinkTapped(dictionary, link)
     self:searchFromSelection(target, link_boxes)
 end
 
-function WikipediaZim:showResultsMenu(results, query)
+function LocalWiki:showResultsMenu(results, query)
     local multi = self.library:isMultiZim()
     local menu_items = {}
     for _i, entry in ipairs(results) do
@@ -2395,7 +2400,7 @@ end
 
 -- ---------- article opening + navigation ----------
 
-function WikipediaZim:openMainPage()
+function LocalWiki:openMainPage()
     if not self:_ensureScanned() then return end
     local first = self.library.zims[1]
     if not first then return end
@@ -2414,7 +2419,7 @@ function WikipediaZim:openMainPage()
     self:openEntry(entry, false)
 end
 
-function WikipediaZim:openEntry(entry, push_history)
+function LocalWiki:openEntry(entry, push_history)
     local base = entry._base
     if not base then
         -- Shouldn't happen, but fall back to first ZIM
@@ -2468,13 +2473,13 @@ function WikipediaZim:openEntry(entry, push_history)
 
     local t0 = os.clock()
     local cleaned = HtmlClean.clean(html, true, self.current_title, {
-        keep_references = G_reader_settings:isTrue("wikipediazim_show_references"),
+        keep_references = G_reader_settings:isTrue("localwiki_show_references"),
     })
     if not cleaned or cleaned == "" then
         cleaned = html
     end
     self.current_html = self:_embedImagesInHtml(z, cleaned, resolved.url or entry.url)
-    logger.info(string.format("wikipediazim: cleaned %s in %.2f s (%d -> %d bytes)",
+    logger.info(string.format("localwiki: cleaned %s in %.2f s (%d -> %d bytes)",
         self.current_title, os.clock() - t0, #html, #self.current_html))
 
     -- Keep the two most recent articles only. Each entry is a full cleaned
@@ -2493,7 +2498,7 @@ function WikipediaZim:openEntry(entry, push_history)
     self:_showViewer()
 end
 
-function WikipediaZim:_applySettings(sz, face, spc, margin)
+function LocalWiki:_applySettings(sz, face, spc, margin)
     self.font_size    = sz     or self.font_size
     self.font_face    = face   -- nil is valid (default serif)
     self.line_spacing = spc    or self.line_spacing
@@ -2505,7 +2510,7 @@ function WikipediaZim:_applySettings(sz, face, spc, margin)
     self:_showViewer()
 end
 
-function WikipediaZim:_showViewer()
+function LocalWiki:_showViewer()
     if not self.current_html then return end
     local t0 = os.clock()
     if self.current_viewer then
@@ -2528,18 +2533,18 @@ function WikipediaZim:_showViewer()
         on_settings = function(sz, face, spc, margin)   self:_applySettings(sz, face, spc, margin) end,
     }
     UIManager:show(self.current_viewer)
-    logger.info(string.format("wikipediazim: viewer shown in %.2f s (%s)",
+    logger.info(string.format("localwiki: viewer shown in %.2f s (%s)",
         os.clock() - t0, self.current_title or "?"))
 end
 
-function WikipediaZim:_goBack()
+function LocalWiki:_goBack()
     local prev = table.remove(self.history)
     if not prev then return end
     self.current_entry = nil  -- so openEntry won't push prev back onto history
     self:openEntry(prev, false)
 end
 
-function WikipediaZim:_followLink(href)
+function LocalWiki:_followLink(href)
     if not href or href == "" then return end
     if href:match("^zim%-img%-zoom:") or href:match("^zim%-image:") then
         local filename = href:match("^zim%-img%-zoom:(.+)") or href:match("^zim%-image:(.+)")
@@ -2616,4 +2621,4 @@ function WikipediaZim:_followLink(href)
     })
 end
 
-return WikipediaZim
+return LocalWiki
