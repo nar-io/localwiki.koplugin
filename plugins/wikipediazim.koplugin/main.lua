@@ -538,6 +538,18 @@ function WikipediaZim:_buildSubMenu()
             end,
         },
         {
+            text = _("Show images in articles"),
+            checked_func = function()
+                return G_reader_settings:nilOrTrue("wikipediazim_show_images")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrTrue("wikipediazim_show_images")
+                -- Cached HTML was built with the previous setting.
+                self._article_lru = nil
+                self._article_lru_keys = nil
+            end,
+        },
+        {
             text_func = function() return _("Folder: ") .. self:_folder() end,
             enabled_func = function() return false end,
         },
@@ -989,7 +1001,7 @@ function WikipediaZim:showSearchHistoryMenu(parent_dialog)
         title = _("Recent searches"),
         item_table = items,
         is_popout = false,
-        width = math.min(Device.screen:getWidth() - 40, Screen:scaleBySize(450)),
+        width = math.min(Device.screen:getWidth() - 40, Device.screen:scaleBySize(450)),
     }
     UIManager:show(menu)
 end
@@ -1321,25 +1333,36 @@ function WikipediaZim:_resolveImageBlob(z, src)
 
     src = src:gsub("#.*$", ""):gsub("%?.*$", "")
     local clean = src:gsub("^%./", ""):gsub("^%.%./", ""):gsub("^/", "")
-    local decoded = url_decode(clean)
 
-    local candidates = {
-        { ns = "C", url = clean },
-        { ns = "C", url = decoded },
-        { ns = "-", url = clean },
-        { ns = "I", url = clean },
-        { ns = "I", url = decoded },
-    }
+    -- Image paths in the ZIM are URL-encoded twice: a file called "+44.jpg"
+    -- is stored as "%252B44.jpg". Try the path as written, once decoded and
+    -- twice decoded; without the second decode covers and pictures whose name
+    -- starts with a punctuation mark never resolve.
+    local variants = { clean }
+    local once = url_decode(clean)
+    if once ~= clean then variants[#variants + 1] = once end
+    local twice = url_decode(once)
+    if twice ~= once then variants[#variants + 1] = twice end
+
+    local candidates = {}
+    local function add(ns, url)
+        candidates[#candidates + 1] = { ns = ns, url = url }
+    end
+    for _, v in ipairs(variants) do
+        add("C", v)
+        add("-", v)
+        add("I", v)
+    end
 
     if clean:match("^I/") then
         local sub = clean:sub(3)
-        table.insert(candidates, { ns = "I", url = sub })
-        table.insert(candidates, { ns = "I", url = url_decode(sub) })
+        add("I", sub)
+        add("I", url_decode(sub))
     end
     if clean:match("^%-/") then
         local sub = clean:sub(3)
-        table.insert(candidates, { ns = "-", url = sub })
-        table.insert(candidates, { ns = "-", url = url_decode(sub) })
+        add("-", sub)
+        add("-", url_decode(sub))
     end
 
     local seen = {}
@@ -1360,10 +1383,13 @@ function WikipediaZim:_resolveImageBlob(z, src)
                 if entry and entry.kind == "article" then
                     local data, mime = z:readArticle(entry)
                     if data and #data > 0 then
+                        -- MuPDF's HTML engine cannot decode WebP: it aborts the
+                        -- whole page render ("failed decoding webp image") and
+                        -- KOReader crashes, so WebP is converted to PNG below.
                         local is_native = false
                         if #data >= 12 and data:sub(1, 4) == "RIFF" and data:sub(9, 12) == "WEBP" then
                             mime = "image/webp"
-                            is_native = true
+                            is_native = false
                         elseif #data >= 4 then
                             local b1, b2, b3, b4 = data:byte(1, 4)
                             if b1 == 0xFF and b2 == 0xD8 then
@@ -1381,8 +1407,9 @@ function WikipediaZim:_resolveImageBlob(z, src)
                             end
                         end
 
-                        -- If format is not natively decoded by MuPDF HTML engine (e.g. SVG or uncompressed BMP),
-                        -- convert it to PNG. Native images (JPEG, PNG, WebP, GIF) are passed directly to MuPDF.
+                        -- If format is not natively decoded by MuPDF HTML engine (e.g. SVG, WebP or
+                        -- uncompressed BMP), convert it to PNG. Native images (JPEG, PNG, GIF) are
+                        -- passed directly to MuPDF.
                         if not is_native then
                             local converted = convert_to_png(data)
                             if converted and #converted > 0 then
@@ -1485,7 +1512,9 @@ end
 
 local function is_decorative_icon(src)
     if not src then return true end
-    local s = src:lower()
+    -- Only the file name is inspected: the directory part ("_assets_/<hash>/")
+    -- is random hex and would otherwise match by accident.
+    local s = (src:match("([^/]+)$") or src):lower()
     return s:find("flag") or s:find("icon") or s:find("pog") or s:find("arrow")
         or s:find("symbol") or s:find("lock") or s:find("increase") or s:find("decrease")
         or s:find("bullet") or s:find("portal") or s:find("edit") or s:find("magnify")
@@ -1495,7 +1524,7 @@ function WikipediaZim:_embedImagesInHtml(z, html, article_url)
     if not html or html == "" then return html end
 
     local BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
-    local show_image = G_reader_settings:nilOrTrue("wikipedia_show_image")
+    local show_image = G_reader_settings:nilOrTrue("wikipediazim_show_images")
     if not show_image then
         -- Image display disabled: nothing to extract. Blank the sources with a
         -- single tag walk instead of two whole-document gsubs, and skip the
@@ -1655,7 +1684,7 @@ end
 
 function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article_url)
     if not z then return nil end
-    local show_image = G_reader_settings:nilOrTrue("wikipedia_show_image")
+    local show_image = G_reader_settings:nilOrTrue("wikipediazim_show_images")
     if not show_image then return nil end
 
     local src, caption = self:_findLeadImageSrc(raw_html, article_url, z)
@@ -1687,9 +1716,11 @@ function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article
         max_h = Device.screen:scaleBySize(135)
     end
 
-    -- Render directly at target dimensions in a single pass, avoiding allocating
-    -- massive multi-megabyte unscaled bitmaps on Kindle RAM.
-    local bb = RenderImage:renderImageData(data, #data, false, max_w, max_h)
+    -- Render at the image's own aspect ratio, scaled down to fit the box.
+    -- Passing both max_w and max_h to the renderer asks MuPDF to fill that
+    -- exact box, which stretches the picture. Ask for the native size first
+    -- and only scale down (never up) if it does not fit.
+    local bb = RenderImage:renderImageData(data, #data, false)
     if not bb then return nil end
 
     local bw = bb:getWidth()
@@ -1716,6 +1747,11 @@ function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article
         _raw_data = data,
     }
 
+    -- TextBoxWidget keeps the aspect ratio when it shrinks the image to fit
+    -- the text column, but it blits the full BlitBuffer into a box of
+    -- image.width x image.height. If the buffer is larger than the reported
+    -- size the picture is drawn stretched/cropped, so the buffer must match
+    -- the reported dimensions exactly.
     image_item.load_bb_func = function(highres)
         if highres then
             if not image_item.hi_bb then
