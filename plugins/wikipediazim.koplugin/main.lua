@@ -1795,21 +1795,48 @@ function WikipediaZim:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article
     return { image_item }
 end
 
-function WikipediaZim:_extractIntroText(cleaned_html, raw_html)
+-- End of the article lead: the first real section heading.
+--
+-- Portable infoboxes (Fandom) put their own <h2 class="pi-title"> inside the
+-- <aside class="portable-infobox">. Cutting the document at the first <h2>
+-- therefore cut it inside the box, and the popup showed nothing but the
+-- article title. Skip the box first, then look for the heading.
+local function find_lead_end(html)
+    local box_start = html:find("<aside[^>]-portable%-infobox")
+    if box_start then
+        local box_end = html:find("</aside>", box_start, true)
+        if box_end then
+            local h2 = html:find("<h2[%s>]", box_end + 8)
+            if h2 then return h2 end
+            local heading = html:find('<div%s+[^>]*class="[^"]*mw%-heading2', box_end + 8)
+            if heading then return heading end
+            return html:find('<section%s+[^>]*data%-mw%-section%-id="[1-9]', box_end + 8)
+        end
+    end
+    return html:find("<h2[%s>]")
+        or html:find('<div%s+[^>]*class="[^"]*mw%-heading2')
+        or html:find('<section%s+[^>]*data%-mw%-section%-id="[1-9]')
+end
+
+function WikipediaZim:_extractIntroText(cleaned_html, raw_html, stop_at_heading, max_chars, max_paras)
     local html = cleaned_html or raw_html or ""
     if html == "" then return "" end
+    max_chars = max_chars or 1800
+    max_paras = max_paras or 4
 
     -- Find boundary of intro before first major section heading
     local lead = html
-    local h2 = lead:find("<h2[%s>]")
-    if not h2 then
-        h2 = lead:find('<div%s+[^>]*class="[^"]*mw%-heading2')
-    end
-    if not h2 then
-        h2 = lead:find('<section%s+[^>]*data%-mw%-section%-id="[1-9]')
-    end
-    if h2 then
-        lead = lead:sub(1, h2 - 1)
+    if stop_at_heading ~= false then
+        local h2 = lead:find("<h2[%s>]")
+        if not h2 then
+            h2 = lead:find('<div%s+[^>]*class="[^"]*mw%-heading2')
+        end
+        if not h2 then
+            h2 = lead:find('<section%s+[^>]*data%-mw%-section%-id="[1-9]')
+        end
+        if h2 then
+            lead = lead:sub(1, h2 - 1)
+        end
     end
 
     -- Strip tables and figures from lead
@@ -1819,6 +1846,7 @@ function WikipediaZim:_extractIntroText(cleaned_html, raw_html)
     lead = lead:gsub('<div%s+[^>]-class="[^"]-thumb[^"]-"[^>]*>.-</div>', "")
 
     local paras = {}
+    local used = 0
     for p in lead:gmatch("<p[^>]*>(.-)</p>") do
         local text = p:gsub("<[^>]+>", "")
         -- Strip any residual opening tag attributes or unclosed brackets
@@ -1833,6 +1861,10 @@ function WikipediaZim:_extractIntroText(cleaned_html, raw_html)
         text = text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
         if #text > 20 then
             paras[#paras + 1] = text
+            used = used + #text
+            -- A popup is a preview, not the article: stop after a few
+            -- paragraphs instead of dumping every section we walked through.
+            if used >= max_chars or #paras >= max_paras then break end
         end
     end
 
@@ -1889,12 +1921,12 @@ function WikipediaZim:_loadArticleIntro(entry)
     local raw_html = html_or_err
 
     -- Optimize dictionary popup intro extraction:
-    -- Find the lead boundary before first major section heading (h2 / mw-heading2 / section 1)
-    -- and clean ONLY the lead section rather than parsing and regexing the entire multi-megabyte article.
-    local h2 = raw_html:find("<h2[%s>]")
-        or raw_html:find('<div%s+[^>]*class="[^"]*mw%-heading2')
-        or raw_html:find('<section%s+[^>]*data%-mw%-section%-id="[1-9]')
-    local lead_raw = h2 and raw_html:sub(1, h2 - 1) or (raw_html:sub(1, 100000))
+    -- Find the lead boundary before first real section heading and clean ONLY
+    -- the lead section rather than parsing and regexing the whole article.
+    -- find_lead_end() skips the <h2> rows of a portable infobox, which would
+    -- otherwise cut the document inside the box.
+    local lead_end = find_lead_end(raw_html)
+    local lead_raw = lead_end and raw_html:sub(1, lead_end - 1) or raw_html:sub(1, 100000)
 
     local cleaned_lead = HtmlClean.clean(lead_raw)
     if not cleaned_lead or cleaned_lead == "" then
@@ -1902,6 +1934,21 @@ function WikipediaZim:_loadArticleIntro(entry)
     end
 
     local intro = decode_html_entities(self:_extractIntroText(cleaned_lead, raw_html))
+
+    -- Wiki pages built from infobox templates (Fandom) often have a one-line
+    -- lead before the first heading, so the popup showed nothing but the
+    -- title. Walk past the headings and take the next paragraphs too, up to
+    -- the same budget, instead of leaving the description empty.
+    if #intro < 400 and #raw_html > #lead_raw then
+        local wider = raw_html:sub(1, math.min(#raw_html, 150 * 1024))
+        local cleaned_wide = HtmlClean.clean(wider)
+        local wider_intro = decode_html_entities(
+            self:_extractIntroText(cleaned_wide, raw_html, false))
+        if #wider_intro > #intro then
+            intro = wider_intro
+        end
+    end
+
     local images = self:_getLeadImageBlitBuffer(z, raw_html, cleaned_lead, resolved.url or entry.url)
 
     return intro, images, resolved
