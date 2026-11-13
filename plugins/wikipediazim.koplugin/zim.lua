@@ -113,7 +113,7 @@ function ZIM.open(path)
         main_page        = u32(h, 65),
         layout_page      = u32(h, 69),
         checksum_pos     = u64(h, 73),
-        cluster_cache    = Cluster.newCache(16),
+        cluster_cache    = Cluster.newCache(),
         _sparse_index    = nil,
     }, ZIM)
 

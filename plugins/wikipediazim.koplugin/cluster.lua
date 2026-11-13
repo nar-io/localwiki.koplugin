@@ -49,10 +49,23 @@ local Cluster = {}
 local M = {}
 
 -- ---------- LRU cache ----------
+--
+-- Bounded by bytes, not by entry count: a cluster holds the whole decompressed
+-- payload, and cluster sizes differ wildly between ZIMs (a Turkish Wikipedia
+-- cluster is ~200 KB, a book ZIM built with few clusters can be 1.2 MB). With
+-- a fixed entry count the cache silently grew to tens of megabytes once
+-- several ZIMs were open, which is what pushed the device into the OOM killer.
 local LRU = {}
 LRU.__index = LRU
-function M.newCache(capacity)
-    return setmetatable({ cap = capacity, items = {}, order = {} }, LRU)
+local DEFAULT_CACHE_BYTES = 4 * 1024 * 1024
+
+function M.newCache(max_bytes)
+    return setmetatable({
+        cap = max_bytes or DEFAULT_CACHE_BYTES,
+        bytes = 0,
+        items = {},
+        order = {},
+    }, LRU)
 end
 function LRU:get(key)
     local v = self.items[key]
@@ -65,19 +78,27 @@ function LRU:get(key)
     return v
 end
 function LRU:put(key, value)
-    if self.items[key] then
+    local old = self.items[key]
+    if old then
+        self.bytes = self.bytes - (old._bytes or 0)
         for i, k in ipairs(self.order) do
             if k == key then table.remove(self.order, i); break end
         end
-    elseif #self.order >= self.cap then
-        local oldest = table.remove(self.order, 1)
-        self.items[oldest] = nil
     end
     self.items[key] = value
     self.order[#self.order + 1] = key
+    self.bytes = self.bytes + (value._bytes or 0)
+    -- Evict oldest until the budget is met, but always keep the newest entry:
+    -- a single cluster larger than the whole budget still has to be usable.
+    while self.bytes > self.cap and #self.order > 1 do
+        local oldest = table.remove(self.order, 1)
+        local v = self.items[oldest]
+        if v then self.bytes = self.bytes - (v._bytes or 0) end
+        self.items[oldest] = nil
+    end
 end
 function LRU:clear()
-    self.items = {}; self.order = {}
+    self.items = {}; self.order = {}; self.bytes = 0
 end
 
 -- ---------- decompression ----------
@@ -199,6 +220,8 @@ function M.parse(info_byte, body)
         off_size = off_size,
         read_off = read_off,
         num_blobs = num_blobs,
+        -- Used by the cache to enforce its byte budget.
+        _bytes   = #payload,
     }, Cluster)
 end
 

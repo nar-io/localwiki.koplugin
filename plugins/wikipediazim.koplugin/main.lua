@@ -1432,7 +1432,10 @@ function WikipediaZim:_resolveImageBlob(z, src)
                         end
 
                         local res = { data = data, mime = mime or "image/jpeg" }
-                        if #z._img_cache_keys >= 16 then
+                        -- Small cache: the bytes are only needed until the
+                        -- picture has been written out as a file, and the
+                        -- lookup popup re-reads them from the ZIM if needed.
+                        if #z._img_cache_keys >= 4 then
                             local oldest = table.remove(z._img_cache_keys, 1)
                             z._img_cache[oldest] = nil
                         end
@@ -2427,7 +2430,10 @@ function WikipediaZim:openEntry(entry, push_history)
     logger.info(string.format("wikipediazim: cleaned %s in %.2f s (%d -> %d bytes)",
         self.current_title, os.clock() - t0, #html, #self.current_html))
 
-    if #self._article_lru_keys >= 6 then
+    -- Keep the two most recent articles only. Each entry is a full cleaned
+    -- HTML document (up to ~350 KB for a long article), and on a 512 MB device
+    -- that competes with the MuPDF layout of the article actually on screen.
+    if #self._article_lru_keys >= 2 then
         local oldest = table.remove(self._article_lru_keys, 1)
         self._article_lru[oldest] = nil
     end
