@@ -1756,7 +1756,7 @@ function LocalWiki:_embedImagesInHtml(z, html, article_url)
     -- so a generous cap is what pushes a 512 MB Kindle into the OOM killer.
     -- Pictures are also skipped entirely on low-memory devices: the MuPDF
     -- document plus its layout cache already fills the budget there.
-    local max_images = 2
+    local max_images = 6
     local count = 0
 
     local replaced_html = html

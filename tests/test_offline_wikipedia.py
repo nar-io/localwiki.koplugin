@@ -861,7 +861,7 @@ class TestWikipediaFullPageStylingAndStructure(unittest.TestCase):
             src = f.read()
 
         self.assertIn("HtmlClean.clean(html, true, self.current_title, {", src)
-        self.assertIn("local max_images = 2", src)
+        self.assertIn("max_images = 6", src)
 
 
 if __name__ == "__main__":
