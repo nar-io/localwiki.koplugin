@@ -125,6 +125,31 @@ for _, c in ipairs(cases) do
     check(string.format("candidate '%s' -> '%s'", c[1], c[2]), hit, table.concat(got, "|"))
 end
 
+-- Per-archive enable/disable and the main-page picker (0.5.0).
+local lib2 = Library.new()
+lib2.zims = {
+    { base = "a.zim", paths = { "/x/a.zim" }, single = true },
+    { base = "b.zim", paths = { "/x/b.zim" }, single = true },
+    { base = "c.zim", paths = { "/x/c.zim" }, single = true },
+}
+for _, e in ipairs(lib2.zims) do lib2.by_base[e.base] = e end
+check("all ZIMs enabled by default", lib2:activeCount() == 3)
+lib2:setDisabled("b.zim", true)
+check("disabled ZIM leaves the active set", lib2:activeCount() == 2)
+check("disabled ZIM is still listed", #lib2.zims == 3)
+check("activeZims skips the disabled one", lib2:activeZims()[2].base == "c.zim")
+lib2:setDisabled("b.zim", false)
+check("re-enabling restores it", lib2:activeCount() == 3)
+lib2:setDisabled("a.zim", true)
+lib2:setDisabled("b.zim", true)
+lib2:setDisabled("c.zim", true)
+check("every ZIM can be switched off", lib2:activeCount() == 0)
+check("unknown ZIM is rejected", lib2:setDisabled("nope.zim", true) == false)
+
+check("openMainPage takes a base argument", debug.getinfo(LocalWiki.openMainPage).nparams >= 2)
+check("showAbout exists", type(LocalWiki.showAbout) == "function")
+check("checkForUpdates exists", type(LocalWiki.checkForUpdates) == "function")
+
 print(string.format("\n%d checks, %d failed", checks, fails))
 os.exit(fails == 0 and 0 or 1)
 LUA

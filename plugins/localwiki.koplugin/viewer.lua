@@ -946,8 +946,22 @@ function Viewer:onShow()
     return true
 end
 
+-- Release the rendered document explicitly. ScrollHtmlWidget keeps a MuPDF
+-- document plus its layout cache; on a 512 MB Kindle, opening article after
+-- article without dropping the previous one ends with the OOM killer taking
+-- KOReader down. freeBb() drops the rendered bitmap, and clearing the widget
+-- references lets the GC reclaim the document itself.
 function Viewer:onCloseWidget()
     UIManager:setDirty(nil, function() return "partial", self.dimen end)
+    local w = self.html_widget
+    if w then
+        if w.htmlbox_widget then
+            pcall(function() w.htmlbox_widget:freeBb() end)
+        end
+        pcall(function() w:free() end)
+        self.html_widget = nil
+    end
+    self[1] = nil
 end
 
 function Viewer:onClose()

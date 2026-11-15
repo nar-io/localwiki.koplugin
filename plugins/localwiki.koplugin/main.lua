@@ -13,6 +13,7 @@ for the rest of the session (one set of file handles per ZIM, regardless
 of how many .zim?? part files it consists of on disk).
 ]]
 
+local ButtonDialog = require("ui/widget/buttondialog")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
@@ -460,6 +461,18 @@ end
 function LocalWiki:onCloseDocument() self:_releaseAll() end
 function LocalWiki:onSuspend()       self:_releaseAll() end
 
+-- KOReader calls this when the reader closes the viewer. Drop the document and
+-- the cleaned HTML right away instead of waiting for the next article: the
+-- MuPDF document plus its layout cache is the single biggest allocation the
+-- plugin holds.
+function LocalWiki:onCloseWidget()
+    -- Do not call UIManager:close() here: KOReader is already tearing the
+    -- widget down and re-entering the manager corrupts its stack. Just drop
+    -- the references so the GC can reclaim the document and the HTML.
+    self.current_viewer = nil
+    self.current_html = nil
+end
+
 function LocalWiki:_releaseAll()
     self.library:closeAll()
     self.history = {}
@@ -492,7 +505,7 @@ function LocalWiki:_buildSubMenu()
     local items = {
         {
             text = _("Search articles"),
-            enabled_func = function() return #self.library.zims > 0 end,
+            enabled_func = function() return self.library:activeCount() > 0 end,
             callback = function() self:openSearchDialog() end,
         },
         {
@@ -505,7 +518,7 @@ function LocalWiki:_buildSubMenu()
         },
         {
             text = _("Open main page"),
-            enabled_func = function() return #self.library.zims > 0 end,
+            enabled_func = function() return self.library:activeCount() > 0 end,
             callback = function() self:openMainPage() end,
         },
         {
@@ -515,6 +528,10 @@ function LocalWiki:_buildSubMenu()
                     return _("No ZIM files found in folder")
                 end
                 local opened = self.library:openedCount()
+                local active = self.library:activeCount()
+                if active < n then
+                    return string.format(_("Loaded ZIMs: %d of %d enabled (%d open)"), active, n, opened)
+                end
                 return string.format(_("Loaded ZIMs: %d (%d open)"), n, opened)
             end,
             keep_menu_open = true,
@@ -563,6 +580,16 @@ function LocalWiki:_buildSubMenu()
             end,
         },
         {
+            text = _("About LocalWiki"),
+            keep_menu_open = true,
+            callback = function() self:showAbout() end,
+        },
+        {
+            text = _("Check for updates"),
+            keep_menu_open = true,
+            callback = function() self:checkForUpdates() end,
+        },
+        {
             text_func = function() return _("Folder: ") .. self:_folder() end,
             enabled_func = function() return false end,
         },
@@ -570,6 +597,121 @@ function LocalWiki:_buildSubMenu()
     return items
 end
 
+-- ---------- about / update ----------
+
+local PLUGIN_REPO = "nar-io/localwiki.koplugin"
+local PLUGIN_VERSION = "0.5.1"
+
+function LocalWiki:showAbout()
+    local lines = {
+        _("LocalWiki — offline ZIM reader for KOReader"),
+        "",
+        string.format(_("Version: %s"), PLUGIN_VERSION),
+        string.format(_("Repository: github.com/%s"), PLUGIN_REPO),
+        "",
+        _("Reads Kiwix ZIM archives (Wikipedia, Wiktionary, Fandom and any other MediaWiki export) straight from the device — no conversion, no companion server."),
+        "",
+        _("Based on c5e3/koreader_wikipedia; the ZIM engine and the original KOReader integration are the upstream author's work."),
+        "",
+        _("License: CC BY-NC 4.0"),
+        "",
+        string.format(_("ZIM folder: %s"), self:_folder()),
+        string.format(_("Archives found: %d (%d enabled)"),
+            #self.library.zims, self.library:activeCount()),
+    }
+    UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n") })
+end
+
+-- Compare the installed version with the latest GitHub release. Runs only
+-- when the reader asks for it, so the plugin never phones home on its own.
+function LocalWiki:checkForUpdates()
+    local ok_http, http = pcall(require, "socket.http")
+    local ok_ltn, ltn12 = pcall(require, "ltn12")
+    local ok_json, rapidjson = pcall(require, "rapidjson")
+    if not (ok_http and ok_ltn and ok_json) then
+        UIManager:show(InfoMessage:new{
+            text = _("Update check needs the network stack; it is not available on this build."),
+        })
+        return
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = _("Checking for updates…"), timeout = 1,
+    })
+
+    local url = string.format("https://api.github.com/repos/%s/releases/latest", PLUGIN_REPO)
+    local chunks = {}
+    local ok, code = http.request{
+        url = url,
+        headers = { ["User-Agent"] = "localwiki-koplugin/" .. PLUGIN_VERSION },
+        sink = ltn12.sink.table(chunks),
+    }
+    if not ok or code ~= 200 then
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("Could not reach GitHub (HTTP %s).\nCheck your Wi-Fi connection."),
+                tostring(code or ok)),
+        })
+        return
+    end
+
+    local body = table.concat(chunks)
+    local parsed_ok, data = pcall(rapidjson.decode, body)
+    if not parsed_ok or type(data) ~= "table" then
+        UIManager:show(InfoMessage:new{ text = _("Unexpected reply from GitHub.") })
+        return
+    end
+
+    local latest = tostring(data.tag_name or data.name or ""):gsub("^v", "")
+    if latest == "" then
+        UIManager:show(InfoMessage:new{ text = _("No releases published yet.") })
+        return
+    end
+
+    local function parts(v)
+        local out = {}
+        for n in tostring(v):gmatch("%d+") do out[#out + 1] = tonumber(n) end
+        return out
+    end
+    local a, b = parts(PLUGIN_VERSION), parts(latest)
+    local newer = false
+    for i = 1, math.max(#a, #b) do
+        local x, y = a[i] or 0, b[i] or 0
+        if y > x then
+            newer = true
+            break
+        elseif y < x then
+            newer = false
+            break
+        end
+    end
+
+    if not newer then
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("You are on the latest version (%s)."), PLUGIN_VERSION),
+        })
+        return
+    end
+
+    -- One row, two buttons: ButtonDialog expects buttons[row][col].
+    UIManager:show(ButtonDialog:new{
+        title = string.format(_("Version %s is available (you have %s)."), latest, PLUGIN_VERSION),
+        buttons = {{
+            {
+                text = _("Open release page"),
+                callback = function()
+                    if self.ui and self.ui.openLinkDialog then
+                        self.ui:openLinkDialog(string.format(
+                            "https://github.com/%s/releases/latest", PLUGIN_REPO))
+                    end
+                end,
+            },
+            { text = _("Close"), callback = function() end },
+        }},
+    })
+end
+
+-- List every discovered ZIM with a switch. Disabled archives are skipped by
+-- search, lookup and the main page, and their file handles are released.
 function LocalWiki:showLoadedZims()
     self:_ensureScanned()
     if #self.library.zims == 0 then
@@ -579,23 +721,52 @@ function LocalWiki:showLoadedZims()
         })
         return
     end
-    local lines = {}
-    for _, e in ipairs(self.library.zims) do
-        local state = e.zim and "● open" or "○ closed"
-        local layout
-        if e.single then
-            layout = "single file"
-        else
-            layout = string.format("%d parts", #e.paths)
-        end
+
+    local buttons = {}
+    for _idx, e in ipairs(self.library.zims) do
+        local on = not self.library:isDisabled(e.base)
+        local layout = e.single and _("single file") or string.format(_("%d parts"), #e.paths)
         local meta = ""
         if e.zim then
-            meta = string.format("  (%d articles)", e.zim.article_count)
+            meta = string.format(_(" · %d articles, open"), e.zim.article_count)
         end
-        lines[#lines + 1] = string.format("%s  %s\n   %s%s",
-            state, e.base, layout, meta)
+        local label = string.format("%s %s\n%s%s",
+            on and "☑" or "☐", e.base, layout, meta)
+        buttons[#buttons + 1] = {{
+            text = label,
+            callback = function()
+                self.library:setDisabled(e.base, on)
+                UIManager:close(self._zim_dialog)
+                self._zim_dialog = nil
+                self:showLoadedZims()
+            end,
+        }}
     end
-    UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n\n") })
+    buttons[#buttons + 1] = {{
+        text = _("Enable all"),
+        enabled = self.library:activeCount() < #self.library.zims,
+        callback = function()
+            for _i, e in ipairs(self.library.zims) do
+                self.library:setDisabled(e.base, false)
+            end
+            UIManager:close(self._zim_dialog)
+            self._zim_dialog = nil
+            self:showLoadedZims()
+        end,
+    }, {
+        text = _("Close"),
+        callback = function()
+            UIManager:close(self._zim_dialog)
+            self._zim_dialog = nil
+        end,
+    }}
+
+    self._zim_dialog = ButtonDialog:new{
+        title = string.format(_("Loaded ZIMs: %d of %d enabled"),
+            self.library:activeCount(), #self.library.zims),
+        buttons = buttons,
+    }
+    UIManager:show(self._zim_dialog)
 end
 
 function LocalWiki:chooseFolder()
@@ -1580,7 +1751,12 @@ function LocalWiki:_embedImagesInHtml(z, html, article_url)
         return r
     end
 
-    local max_images = 6
+    -- Cap the pictures embedded into one article. Each decoded bitmap is a
+    -- full-size RGB buffer and a Fandom page can carry a thousand <img> tags,
+    -- so a generous cap is what pushes a 512 MB Kindle into the OOM killer.
+    -- Pictures are also skipped entirely on low-memory devices: the MuPDF
+    -- document plus its layout cache already fills the budget there.
+    local max_images = 2
     local count = 0
 
     local replaced_html = html
@@ -1903,7 +2079,7 @@ function LocalWiki:_extractIntroText(cleaned_html, raw_html, stop_at_heading, ma
 end
 
 function LocalWiki:_loadArticleIntro(entry)
-    local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
+    local base = entry._base or (self.library:activeZims()[1] or {}).base
     if not base then
         return _("Article not found."), nil
     end
@@ -2171,7 +2347,7 @@ function LocalWiki:showInLookupWindow(results, query, boxes, dict_close_callback
     local seen_targets = {}
 
     for _i, entry in ipairs(results) do
-        local base = entry._base or (self.library.zims[1] and self.library.zims[1].base)
+        local base = entry._base or (self.library:activeZims()[1] or {}).base
         local target_key = (base or "") .. ":" .. (entry.url or "")
         if not seen_targets[target_key] then
             seen_targets[target_key] = true
@@ -2369,30 +2545,67 @@ end
 
 -- ---------- article opening + navigation ----------
 
-function LocalWiki:openMainPage()
+-- Open the main page of one ZIM. With several archives enabled there is no
+-- single "the" home page, so the reader picks which one; with exactly one
+-- enabled archive this goes straight there.
+function LocalWiki:openMainPage(base)
     if not self:_ensureScanned() then return end
-    local first = self.library.zims[1]
-    if not first then return end
-    local z, err = self.library:open(first.base)
+    local active = self.library:activeZims()
+    if #active == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("Every ZIM is switched off. Enable one under \"Loaded ZIMs\"."),
+        })
+        return
+    end
+    if not base then
+        if #active == 1 then
+            base = active[1].base
+        else
+            -- ButtonDialog wants one row per entry: {{ {text=…}, {text=…} }}
+            -- (it lays out up to two buttons per row). Passing a flat list of
+            -- single-button tables leaves it with nothing to draw.
+            local buttons = {}
+            for _i, e in ipairs(active) do
+                local label = e.base
+                if self.library.active_base == e.base then
+                    label = "● " .. label
+                end
+                buttons[#buttons + 1] = {
+                    { text = label, callback = function() self:openMainPage(e.base) end },
+                }
+            end
+            UIManager:show(ButtonDialog:new{
+                title = _("Open main page of…"),
+                buttons = buttons,
+            })
+            return
+        end
+    end
+    local z, err = self.library:open(base)
     if not z then
         UIManager:show(InfoMessage:new{ text = tostring(err) })
         return
     end
     local entry = z:getMainPageEntry()
     if not entry then
-        UIManager:show(InfoMessage:new{ text = _("This ZIM has no main page.") })
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("%s has no main page."), base),
+        })
         return
     end
-    entry._base = first.base
+    entry._base = base
     self.history = {}
     self:openEntry(entry, false)
 end
 
 function LocalWiki:openEntry(entry, push_history)
+    -- The article leaving the screen frees its images before the next one
+    -- extracts its own; doing it later would wipe the new article's pictures.
+    self:_dropArticleImages()
     local base = entry._base
     if not base then
         -- Shouldn't happen, but fall back to first ZIM
-        base = self.library.zims[1] and self.library.zims[1].base
+        base = (self.library:activeZims()[1] or {}).base
     end
     local z, err = self.library:open(base)
     if not z then
@@ -2451,13 +2664,14 @@ function LocalWiki:openEntry(entry, push_history)
     logger.info(string.format("localwiki: cleaned %s in %.2f s (%d -> %d bytes)",
         self.current_title, os.clock() - t0, #html, #self.current_html))
 
-    -- Keep the two most recent articles only. Each entry is a full cleaned
-    -- HTML document (up to ~350 KB for a long article), and on a 512 MB device
+    -- Keep only the article currently on screen. Each entry is a full cleaned
+    -- HTML document (up to ~350 KB for a long article) and on a 512 MB device
     -- that competes with the MuPDF layout of the article actually on screen.
-    if #self._article_lru_keys >= 2 then
-        local oldest = table.remove(self._article_lru_keys, 1)
-        self._article_lru[oldest] = nil
+    -- Back re-reads from the ZIM instead, which costs a few milliseconds.
+    for i = 1, #self._article_lru_keys do
+        self._article_lru[self._article_lru_keys[i]] = nil
     end
+    self._article_lru_keys = {}
     self._article_lru_keys[#self._article_lru_keys + 1] = cache_key
     self._article_lru[cache_key] = {
         html = self.current_html,
@@ -2479,16 +2693,53 @@ function LocalWiki:_applySettings(sz, face, spc, margin)
     self:_showViewer()
 end
 
+-- Free the decoded image blobs and the extracted files of the article that is
+-- leaving the screen. A Fandom page carries hundreds of <img> tags and their
+-- decoded bitmaps are the heaviest thing the plugin keeps in memory.
+function LocalWiki:_dropArticleImages()
+    if self._extracted_img_files then
+        local dir = getTempImageDir()
+        for filename in pairs(self._extracted_img_files) do
+            pcall(os.remove, dir .. "/" .. filename)
+        end
+        self._extracted_img_files = nil
+    end
+    -- The viewer still holds the previous document; drop the decoded blobs so
+    -- the GC can take them back before the next article allocates its own.
+    if self.library then
+        for _i, e in ipairs(self.library.zims) do
+            if e.zim then
+                e.zim._img_cache = nil
+                e.zim._img_cache_keys = nil
+                e.zim._img_file_cache = nil
+            end
+        end
+    end
+end
+
 function LocalWiki:_showViewer()
     if not self.current_html then return end
     local t0 = os.clock()
     if self.current_viewer then
+        -- Drop the old viewer outright. Keeping a reference to it (or to the
+        -- article it rendered) holds a whole MuPDF document plus its layout
+        -- cache alive; on a 512 MB Kindle, browsing a few articles that way
+        -- ends with the OOM killer taking KOReader down.
         UIManager:close(self.current_viewer)
         self.current_viewer = nil
+        -- The closed viewer's MuPDF document is only reclaimed once the GC
+        -- runs. On the Kindle that happens too late: the next article
+        -- allocates while the old one is still resident, and the OOM killer
+        -- steps in. Collect now, while nothing new has been built yet.
+        collectgarbage("collect")
     end
+    -- The previous article's HTML is no longer on screen; the LRU keeps a
+    -- small copy for Back, this field does not need to.
+    local html = self.current_html
+    self.current_html = nil
     self.current_viewer = Viewer:new{
         title        = self.current_title or "",
-        html         = self.current_html,
+        html         = html,
         html_resource_directory = getTempImageDir(),
         font_size    = self.font_size,
         font_face    = self.font_face,
@@ -2571,7 +2822,7 @@ function LocalWiki:_followLink(href)
             tried[base] = true
         end
     end
-    for _, e in ipairs(self.library.zims) do
+    for _, e in ipairs(self.library:activeZims()) do
         if not tried[e.base] then
             local z = self.library:open(e.base)
             if z then

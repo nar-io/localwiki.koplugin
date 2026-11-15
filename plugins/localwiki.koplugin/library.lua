@@ -27,7 +27,53 @@ function Library.new()
         folder = nil,
         zims = {},        -- array of { base, paths={…}, zim=nil_until_opened }
         by_base = {},     -- base_name -> entry (same table as in zims[])
+        -- base_name -> true for archives the reader switched off. Disabled
+        -- ZIMs stay in `zims` so the settings menu can list them, but search,
+        -- lookup and the main page skip them and their file handles are
+        -- released.
+        disabled = {},
     }, Library)
+end
+
+-- Is this logical ZIM switched off by the reader?
+function Library:isDisabled(base)
+    return self.disabled[base] == true
+end
+
+-- Switch a logical ZIM on or off. Disabling closes its file handles and
+-- drops it from the active set; enabling leaves it to be opened lazily.
+function Library:setDisabled(base, disabled)
+    local entry = self.by_base[base]
+    if not entry then return false end
+    if disabled then
+        self.disabled[base] = true
+        if entry.zim then
+            pcall(function() entry.zim:close() end)
+            entry.zim = nil
+        end
+    else
+        self.disabled[base] = nil
+    end
+    return true
+end
+
+-- Logical ZIMs the reader has left enabled, in scan order.
+function Library:activeZims()
+    local out = {}
+    for _, e in ipairs(self.zims) do
+        if not self.disabled[e.base] then
+            out[#out + 1] = e
+        end
+    end
+    return out
+end
+
+function Library:activeCount()
+    local n = 0
+    for _, e in ipairs(self.zims) do
+        if not self.disabled[e.base] then n = n + 1 end
+    end
+    return n
 end
 
 local function dir_exists(path)
@@ -115,17 +161,18 @@ function Library:closeAll()
 end
 
 local function ordered_zims(self)
-    if not self.active_base or #self.zims <= 1 then
-        return self.zims
+    local active = self:activeZims()
+    if not self.active_base or #active <= 1 then
+        return active
     end
     local ordered = {}
-    for _, e in ipairs(self.zims) do
+    for _, e in ipairs(active) do
         if e.base == self.active_base then
             ordered[#ordered + 1] = e
             break
         end
     end
-    for _, e in ipairs(self.zims) do
+    for _, e in ipairs(active) do
         if e.base ~= self.active_base then
             ordered[#ordered + 1] = e
         end

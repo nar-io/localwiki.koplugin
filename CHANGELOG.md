@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — Unreleased
+
+### Fixed
+- **Crash while browsing a long article** (`Killed` in `crash.log`, OOM killer
+  taking `reader.lua` at ~240 MB RSS). Four things held memory that no longer
+  had a use: the previous viewer was closed but kept referenced, the cleaned
+  HTML of the last two articles stayed in an LRU, every decoded image blob and
+  extracted image file survived the article that needed it, and up to six
+  pictures were embedded per page. Each article now releases the previous one's
+  document, HTML and images before loading its own, the article cache holds one
+  entry, and the per-article image cap is four.
+- **`showLoadedZims` crashed** with `attempt to call local '_' (a number
+  value)`: the loop variable `_` shadowed the gettext function. Renamed.
+
+### Added
+- Per-archive switches, About, and Check for updates (see 0.5.0 below).
+
+## [0.5.0] — Unreleased
+
+### Added
+- **Per-archive switches.** "Loaded ZIMs" now lists every archive with a
+  checkbox, so a reader with Wikipedia, Wiktionary and a Fandom wiki in the
+  same folder can keep only the ones they want. A disabled archive is skipped
+  by search, lookup and the main page, and its file handles are closed.
+- **About LocalWiki** menu entry: version, repository, licence, upstream
+  credit, and how many archives were found and enabled.
+- **Check for updates**: asks GitHub for the latest release and offers the
+  release page when a newer version exists. Runs only when tapped.
+
+### Fixed
+- **Main page with several archives.** "Open main page" always opened the
+  first ZIM in the folder, so with more than one archive there was no way to
+  reach the others' home pages. It now asks which archive to open — or goes
+  straight there when only one is enabled.
+- **Main page could resolve to a redirect entry.** The ZIM header's main-page
+  index points at a synthetic `mainPage` redirect, and the plugin returned
+  that entry as-is, so opening the main page read a redirect record instead of
+  an article. The redirect chain is now followed to the real article.
+
 ## [0.4.0] — Unreleased
 
 The plugin was renamed from `wikipediazim` to `localwiki`. Existing settings

@@ -459,9 +459,21 @@ function ZIM:readArticle(entry)
     return content, mime, entry
 end
 
+-- The header's main-page index usually points at a synthetic "mainPage"
+-- redirect entry (libzim writes one), not at the article itself. Resolve the
+-- chain so callers always get a readable article.
 function ZIM:getMainPageEntry()
     if self.main_page == 0xFFFFFFFF then return nil end
-    return self:getEntryByIndex(self.main_page)
+    local entry = self:getEntryByIndex(self.main_page)
+    local hops = 0
+    while entry and entry.kind == "redirect" and hops < 8 do
+        local target = entry.redirect_idx
+        if not target or target >= self.article_count then return nil end
+        entry = self:getEntryByIndex(target)
+        hops = hops + 1
+    end
+    if not entry or entry.kind ~= "article" then return nil end
+    return entry
 end
 
 return ZIM

@@ -1,7 +1,7 @@
 local _ = require("gettext")
 return {
     name = "localwiki",
-    version = "0.4.0",
+    version = "0.5.1",
     fullname = _("LocalWiki (offline ZIM)"),
     description = _("Browse and search local Wikipedia and ZIM files directly, no conversion needed."),
 }
