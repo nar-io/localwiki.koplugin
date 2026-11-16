@@ -15,6 +15,7 @@ of how many .zim?? part files it consists of on disk).
 
 local ButtonDialog = require("ui/widget/buttondialog")
 local InfoMessage = require("ui/widget/infomessage")
+local Font = require("ui/font")
 local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
 local PathChooser = require("ui/widget/pathchooser")
@@ -26,6 +27,7 @@ local _ = require("gettext")
 local ok_dict, DictQuickLookup = pcall(require, "ui/widget/dictquicklookup")
 
 local Library = require("library")
+local TitleIndex = require("titleindex")
 local Viewer = require("viewer")
 local HtmlClean = require("htmlclean")
 
@@ -48,6 +50,57 @@ end
 
 local function _defaultFontFace()
     return G_reader_settings:readSetting("copt_fontface")  -- may be nil
+end
+
+local function sanitizeDictButtonConfig()
+    local config = G_reader_settings:readSetting("dict_button_config")
+    if config and config.layout then
+        local modified = false
+        for i = #config.layout, 1, -1 do
+            local row = config.layout[i]
+            if type(row) == "table" then
+                for j = #row, 1, -1 do
+                    if row[j] == "wikipedia_offline" then
+                        table.remove(row, j)
+                        modified = true
+                    end
+                end
+                if #row == 0 then
+                    table.remove(config.layout, i)
+                    modified = true
+                end
+            end
+        end
+        if config.order then
+            for j = #config.order, 1, -1 do
+                if config.order[j] == "wikipedia_offline" then
+                    table.remove(config.order, j)
+                    modified = true
+                end
+            end
+        end
+        if modified then
+            G_reader_settings:saveSetting("dict_button_config", config)
+        end
+    end
+end
+
+local function sanitizeDictLayout(dict_module)
+    if not dict_module or not dict_module.default_layout then return end
+    local layout = dict_module.default_layout
+    for i = #layout, 1, -1 do
+        local row = layout[i]
+        if type(row) == "table" then
+            for j = #row, 1, -1 do
+                if row[j] == "wikipedia_offline" then
+                    table.remove(row, j)
+                end
+            end
+            if #row == 0 then
+                table.remove(layout, i)
+            end
+        end
+    end
 end
 
 local LocalWiki = WidgetContainer:extend{
@@ -96,6 +149,10 @@ function LocalWiki:init()
     if self.ui and self.ui.registerPostInitCallback then
         self.ui:registerPostInitCallback(function()
             self:registerSelectionHooks()
+            -- Index at startup, not on first document: the reader may sit in
+            -- the file browser for a long time before opening anything, and
+            -- a missing index would then surprise them mid-search.
+            self:_indexOnStartup()
         end)
     end
 end
@@ -104,55 +161,12 @@ function LocalWiki:onReaderReady()
     self:registerSelectionHooks()
 end
 
-local function sanitizeDictLayout(dict_module)
-    if not dict_module or not dict_module.default_layout then return end
-    local layout = dict_module.default_layout
-    for i = #layout, 1, -1 do
-        local row = layout[i]
-        if type(row) == "table" then
-            for j = #row, 1, -1 do
-                if row[j] == "wikipedia_offline" then
-                    table.remove(row, j)
-                end
-            end
-            if #row == 0 then
-                table.remove(layout, i)
-            end
-        end
-    end
-end
 
-local function sanitizeDictButtonConfig()
-    local config = G_reader_settings:readSetting("dict_button_config")
-    if config and config.layout then
-        local modified = false
-        for i = #config.layout, 1, -1 do
-            local row = config.layout[i]
-            if type(row) == "table" then
-                for j = #row, 1, -1 do
-                    if row[j] == "wikipedia_offline" then
-                        table.remove(row, j)
-                        modified = true
-                    end
-                end
-                if #row == 0 then
-                    table.remove(config.layout, i)
-                    modified = true
-                end
-            end
-        end
-        if config.order then
-            for j = #config.order, 1, -1 do
-                if config.order[j] == "wikipedia_offline" then
-                    table.remove(config.order, j)
-                    modified = true
-                end
-            end
-        end
-        if modified then
-            G_reader_settings:saveSetting("dict_button_config", config)
-        end
-    end
+function LocalWiki:registerSelectionHooks()
+    self:addToHighlightDialog()
+    self:registerDictButtons()
+    self:hookWikipediaModule()
+    self:patchDictQuickLookup()
 end
 
 function LocalWiki:patchDictQuickLookup()
@@ -246,13 +260,6 @@ function LocalWiki:patchDictQuickLookup()
 
         return buttons
     end
-end
-
-function LocalWiki:registerSelectionHooks()
-    self:addToHighlightDialog()
-    self:registerDictButtons()
-    self:hookWikipediaModule()
-    self:patchDictQuickLookup()
 end
 
 function LocalWiki:addToHighlightDialog()
@@ -375,8 +382,48 @@ function LocalWiki:_folder()
     return G_reader_settings:readSetting(SETTING_FOLDER) or DEFAULT_FOLDER
 end
 
--- Lazy: only scans the folder the first time the user actually does anything.
--- Returns true if at least one logical ZIM was found.
+-- Title index for one logical ZIM, read once from the archive's own
+-- titleOrdered listing and cached for the session. This replaces the old
+-- word index: no scan, no per-word tables, no OOM on large wikis.
+-- Archives above this size keep their titles out of RAM: 1.2M lowercased
+-- strings is more than the 474 MB device has, and the reader was killed the
+-- moment the index was built. Their prefix search is good enough, and their
+-- titles are far more predictable than a fandom wiki's.
+local TITLE_INDEX_MAX_ARTICLES = 200000
+
+function LocalWiki:_titleIndex(base)
+    if not self._title_indexes then self._title_indexes = {} end
+    if self._title_indexes[base] ~= nil then
+        return self._title_indexes[base] or nil
+    end
+    local z = self.library:open(base)
+    if not z then
+        self._title_indexes[base] = false
+        return nil
+    end
+    if z.article_count > TITLE_INDEX_MAX_ARTICLES then
+        logger.info(string.format("localwiki: skipping title index for %s (%d articles)", base, z.article_count))
+        self._title_indexes[base] = false
+        return nil
+    end
+    local entries = TitleIndex.load(z)
+    if not entries then
+        self._title_indexes[base] = false
+        return nil
+    end
+    local idx = TitleIndex.new(entries)
+    logger.info(string.format("localwiki: title index for %s has %d entries", base, idx:entryCount()))
+    self._title_indexes[base] = idx
+    return idx
+end
+
+-- Nothing to prebuild any more. The title listing is read straight from each
+-- archive on first use (a few milliseconds for a fandom wiki), so startup no
+-- longer scans articles, writes .idx files or holds every archive open.
+function LocalWiki:_indexOnStartup()
+    return
+end
+
 function LocalWiki:_ensureScanned()
     if self._scanned then return #self.library.zims > 0 end
     self._scanned = true
@@ -1287,6 +1334,8 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
                 local key = (hit._base or "") .. ":" .. (hit.url or "")
                 if not seen_keys[key] then
                     seen_keys[key] = true
+                    -- _size is filled in by Library:prefixSearch so ranking
+                    -- can compare prefix hits with word-index hits.
                     results[#results + 1] = hit
                     if #results >= max_results then break end
                 end
@@ -1294,7 +1343,128 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
         end
     end
 
-    -- 3. If no results found, show empty result in lookup window
+    -- 3. Word-index pass: find articles whose title contains the query as a
+    -- word anywhere, not just at the start. This is what makes "Snape" reach
+    -- "Severus Snape" and "Snape's Portrait". Runs after the prefix pass so
+    -- prefix hits keep their place, and only when the query is a single word
+    -- (multi-word queries are handled by the prefix pass plus ranking).
+    local query_words = {}
+    for w in query:lower():gsub("[^%w%s%-']", " "):gmatch("%S+") do
+        w = w:gsub("'s$", ""):gsub("'$", "")
+        if #w >= 2 then query_words[#query_words + 1] = w end
+    end
+    -- The title listing is read straight from the archive, so there is no
+    -- article-count ceiling: a 1.8M-article Wikipedia costs one sequential
+    -- read of its listing, not a full scan.
+    if #query_words > 0 then
+        for _, e in ipairs(self.library:activeZims()) do
+            local z = self.library:open(e.base)
+            local idx
+            if z then
+                idx = self:_titleIndex(e.base)
+            end
+            if idx and z then
+                local hits = idx:lookup_all(query_words, 60)
+                if hits then
+                    -- Each hit carries its directory index, so resolving one
+                    -- is a single read — no binary search per result.
+                    local indices = {}
+                    for _, h in ipairs(hits) do
+                        -- A nil idx would make entriesForIndices skip the hit
+                        -- silently; the index always writes one, so a nil here
+                        -- means a corrupt entry and the hit is dropped.
+                        if h.idx then indices[#indices + 1] = h.idx end
+                    end
+                    for _, found in ipairs(z:entriesForIndices(indices)) do
+                        local key = e.base .. ":" .. (found.url or "")
+                        if not seen_keys[key] then
+                            seen_keys[key] = true
+                            found._base = e.base
+                            -- No size: one cluster decompression per hit is
+                            -- what made searches slow and got the reader
+                            -- OOM-killed. Ranking uses title shape instead.
+                            results[#results + 1] = found
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- 4. Rank the results. prefixSearch walks the archive in path order, and
+    -- in a path an apostrophe (39) sorts before an underscore (95), so
+    -- "Frodo's_Song" always came before "Frodo_Baggins" — searching a
+    -- character name buried the character under event articles. Order by how
+    -- likely a title is to be the thing the reader meant:
+    --   0. the query itself as a title
+    --   1. a single bare word (character / item / place articles)
+    --   2. a short title (two or three words)
+    --   3. everything else, shortest first
+    -- Ties fall back to alphabetical so the list is stable between searches.
+    local query_key = query:gsub(" ", "_")
+    local q_lower = query:lower():gsub(" ", "_")
+    -- A prefix hit whose title *is* the query is the same article the exact
+    -- pass already put in tier 0; without this it reappeared in tier 1 and
+    -- pushed the real character article down ("Charizard" 372 KB landed
+    -- below "Ash's_Charizard" 408 KB).
+    local function is_exact_title(url)
+        return url == query_key or url:lower() == q_lower
+    end
+    local function rank(entry)
+        local url = entry.url or ""
+        local lower = url:lower()
+        local words = 0
+        for _ in url:gmatch("[^_]+") do words = words + 1 end
+
+        -- Does the query match the *last* word of the title? "Snape" ->
+        -- "Severus_Snape" is almost certainly the person the reader meant,
+        -- while "Snape's_Bias" is a detail article about them.
+        local last_word = lower:match("([^_]+)$") or ""
+        local suffix_hit = (last_word == q_lower)
+
+        -- Tiers, most relevant first:
+        --   0  the title *is* the query
+        --   1  a short title (<= 3 words) that contains the query
+        --   2  a single-word title
+        --   3  everything else
+        -- A short title is one tier whether the query sits at the end
+        -- ("Severus_Snape") or the start ("Snape_with_Thorp"): both are
+        -- about the query, and size decides between them. Splitting them
+        -- put a 95 KB article below a 7 KB one purely on word order.
+        local tier
+        if is_exact_title(url) then
+            tier = 0
+        elseif words <= 3 then
+            tier = 1
+        elseif words == 1 then
+            tier = 2
+        else
+            tier = 3
+        end
+
+        -- Within a tier: a title that *ends* with the query first (the
+        -- person, not the event), then the shorter title. Article size would
+        -- be the better key, but measuring it costs a cluster decompression
+        -- per result — the reader was OOM-killed doing exactly that on this
+        -- device, so title shape carries the ranking instead.
+        return tier, (suffix_hit and 0 or 1), #url, url
+    end
+    table.sort(results, function(a, b)
+        local at, as, al, au = rank(a)
+        local bt, bs, bl, bu = rank(b)
+        if at ~= bt then return at < bt end
+        if as ~= bs then return as < bs end
+        if al ~= bl then return al < bl end
+        return au < bu
+    end)
+
+    -- The word-index pass can push the list past the cap; trim after ranking
+    -- so the best matches survive rather than whichever were found first.
+    for i = #results, max_results + 1, -1 do
+        results[i] = nil
+    end
+
+    -- 4. If no results found, show empty result in lookup window
     if #results == 0 then
         local dummy_results = {
             {
