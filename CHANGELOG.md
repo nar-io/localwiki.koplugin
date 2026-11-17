@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.9] — 2026-11-17
+
+### Fixed
+- Reading a ZIM on Android no longer crashes KOReader with SIGSEGV as soon as
+  an article opens. ZIM clusters carry no content-size header, so the plugin
+  fell through to zstd's streaming API — which the Android build's bundled
+  zstd does not expose, faulting at address 0x0. Frames without a known size
+  are now decoded with a growing destination buffer instead, which lands on
+  the first attempt for typical compression ratios.
+- zstd/lzma are now resolved the way KOReader itself resolves them
+  (`ffi.findlib`), so Android finds them inside `libkoreader-monolibtic.so`
+  and the Kindle keeps using its own `libzstd.so.1`.
+- FFI calls keep a strong reference to their input string. The raw pointer
+  handed to C could outlive the Lua string behind it once the GC ran.
+
+### Changed
+- The "Offline Wikipedia" button now actually shows up in the dictionary
+  window. KOReader has no `show_func` field in its dictionary button spec —
+  the old one was silently ignored — and conditional buttons only render when
+  a `default_layout` exists, which is usually not the case once a
+  `dict_button_config` has been saved.
+- The button is no longer stripped out of a saved dictionary layout on every
+  lookup and every start.
+- The lookup window preloads the article intro on Android too. The old
+  platform carve-out showed "Tap to open article." because eager cluster work
+  used to crash there; the crash was the decompression path, not the window.
+
+## [0.6.8] — 2026-11-17
+
+### Fixed
+- Android KOReader's monolibtic build can now provide zstd/lzma decompression
+  instead of reporting that libzstd is unavailable.
+
+## [0.6.7] — 2026-11-17
+
+### Fixed
+- Android KOReader builds without `dictionary:addToDictButtons` can now load
+  the plugin instead of aborting initialization.
+- Highlight-menu registration now checks for the API before use.
+
+## [0.6.6] — 2026-11-17
+
+### Fixed
+- Android title searches no longer build or use the legacy word index.
+- Android lookup results avoid eager ZIM article and bitmap decoding.
+- Prefix searches normalize uppercase ZIM title candidates.
+- Title-index and entry-resolution failures are guarded instead of reaching the UI.
+
 ## [0.6.5] — 2026-11-17
 
 ### Changed
