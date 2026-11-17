@@ -971,15 +971,24 @@ function LocalWiki:_installUpdate(version, release)
         return
     end
 
-    local made, make_err = util.makePath(temp_dir)
-    if not made then
+    -- util.makePath reports "File exists" when the directory is already there,
+    -- which happens on every retry and on any build whose mkdir surfaces
+    -- EEXIST instead of swallowing it. Create the folder ourselves and treat
+    -- "already exists" as success.
+    if not lfs.attributes(temp_dir, "mode") then
+        lfs.mkdir(temp_dir)
+    end
+    if lfs.attributes(temp_dir, "mode") ~= "directory" then
         os.remove(archive_path)
-        UIManager:show(InfoMessage:new{ text = tostring(make_err or _("Could not create an update folder.")) })
+        UIManager:show(InfoMessage:new{ text = _("Could not create an update folder.") })
         return
     end
 
+    logger.info("localwiki: update unpacking " .. archive_path)
     local arc = Archiver.Reader:new()
     local opened = arc:open(archive_path)
+    logger.info("localwiki: update archive opened = " .. tostring(opened)
+        .. " err=" .. tostring(arc.err))
     local extracted = opened
     if opened then
         for entry in arc:iterate() do
@@ -990,7 +999,9 @@ function LocalWiki:_installUpdate(version, release)
                 extracted = false
                 break
             end
-            if not arc:extractToPath(path, temp_dir .. "/" .. path) then
+            local ok_x, xerr = arc:extractToPath(path, temp_dir .. "/" .. path)
+            if not ok_x then
+                logger.warn("localwiki: extract failed on " .. path .. " -> " .. tostring(xerr))
                 extracted = false
                 break
             end
@@ -1009,6 +1020,7 @@ function LocalWiki:_installUpdate(version, release)
 
     self.library:closeAll()
     local backup_dir = plugin_dir .. ".bak-" .. stamp
+    logger.info("localwiki: rename " .. plugin_dir .. " -> " .. backup_dir)
     if not os.rename(plugin_dir, backup_dir) then
         ffiUtil.purgeDir(temp_dir)
         UIManager:show(InfoMessage:new{ text = _("Could not replace the current plugin folder.") })
@@ -1020,6 +1032,22 @@ function LocalWiki:_installUpdate(version, release)
         os.rename(backup_dir, plugin_dir)
         UIManager:show(InfoMessage:new{ text = _("Could not install the downloaded update.") })
         return
+    end
+
+    -- Drop older backups: a failed update leaves one behind for rollback, but
+    -- nothing ever cleaned up the ones from successful updates, so they piled
+    -- up next to the plugin folder.
+    local backups = {}
+    local ok_dir, dir_iter = pcall(lfs.dir, plugins_dir)
+    if ok_dir and dir_iter then
+        for name in dir_iter do
+            if name:sub(1, #("localwiki.koplugin.bak-")) == "localwiki.koplugin.bak-" then
+                backups[#backups + 1] = plugins_dir .. "/" .. name
+            end
+        end
+    end
+    for _i, path in ipairs(backups) do
+        if path ~= backup_dir then ffiUtil.purgeDir(path) end
     end
 
     UIManager:askForRestart(string.format(_("LocalWiki %s was installed. Restart KOReader to finish the update."), version))

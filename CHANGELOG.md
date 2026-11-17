@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.10] — 2026-11-17
+
+### Fixed
+- "Check for Updates" no longer fails with "File exists" when creating its
+  working folder. The folder is created directly and an existing one is
+  treated as success instead of an error.
+- Backup folders from previous updates are cleaned up after a successful
+  install instead of piling up next to the plugin.
+
 ## [0.6.9] — 2026-11-17
 
 ### Fixed
