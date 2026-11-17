@@ -3,5 +3,6 @@ return {
     name = "localwiki",
     version = "0.5.1",
     fullname = _("LocalWiki (offline ZIM)"),
-    description = _("Browse and search local Wikipedia and ZIM files directly, no conversion needed."),
+    description = _("Read Wikipedia and other ZIM encyclopedias offline."),
+    icon = "icon.svg",
 }
