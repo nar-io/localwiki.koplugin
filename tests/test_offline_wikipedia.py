@@ -590,7 +590,7 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
 
         # Selection menu registration (Highlight menu & DictQuickLookup popup)
         self.assertIn("addToHighlightDialog", content)
-        self.assertIn('"05_wikipedia_offline"', content)
+        self.assertIn('"05b_wikipedia_offline"', content)
         self.assertIn("registerDictButtons", content)
         self.assertIn("addToDictButtons", content)
         self.assertIn('"wikipedia_offline"', content)
@@ -626,8 +626,11 @@ class TestKOReaderIntegrationContract(unittest.TestCase):
         self.assertIn("lookup_window.lookupWikipedia", content)
         self.assertIn("self:openEntry(entry, true)", content)
 
-        # Offline Wikipedia button suppression inside its own window
-        self.assertTrue("dict_popup.is_offline_wiki" in content)
+        # The button no longer suppresses itself through a show_func (KOReader
+        # has no such field); the offline-wiki guard now lives in buildButtonLayout.
+        self.assertTrue('btn.id == "wikipedia_offline"' in content)
+        self.assertNotIn('show_func = function(dict_popup)', content)
+        self.assertNotIn("conditional = true", content)
 
         # Internal link navigation callback
         self.assertIn("html_dictionary_link_tapped_callback", content)
@@ -874,6 +877,33 @@ class TestMainMenu(unittest.TestCase):
         main_src = (Path(PLUGIN_DIR) / "main.lua").read_text(encoding="utf-8")
         self.assertIn('sorting_hint = "search_settings"', main_src)
         self.assertNotIn('sorting_hint = "more_tools"', main_src)
+
+    def test_lookup_preloads_intro_on_every_platform(self):
+        """Android is no longer special-cased.
+
+        The old branch showed "Tap to open article." instead of the article
+        text because eager cluster work crashed there. That crash came from
+        the zstd streaming path, not from the lookup window, so the platform
+        carve-out is gone and every platform preloads the real intro.
+        """
+        main_src = (Path(PLUGIN_DIR) / "main.lua").read_text(encoding="utf-8")
+        self.assertNotIn('item.definition = _("Tap to open article.")', main_src)
+        self.assertIn("self:_loadArticleIntro(entry)", main_src)
+
+    def test_search_skips_legacy_word_index_build(self):
+        main_src = (Path(PLUGIN_DIR) / "main.lua").read_text(encoding="utf-8")
+        self.assertNotIn("word_idx = self:_wordIndex", main_src)
+        self.assertIn("title_idx:lookup_all(query_words, 60)", main_src)
+
+    def test_optional_dictionary_and_highlight_apis_are_guarded(self):
+        main_src = (Path(PLUGIN_DIR) / "main.lua").read_text(encoding="utf-8")
+        self.assertIn('type(self.ui.dictionary.addToDictButtons) ~= "function"', main_src)
+        self.assertIn('type(self.ui.highlight.addToHighlightDialog) ~= "function"', main_src)
+
+    def test_android_monolibtic_decompression_is_supported(self):
+        cluster_src = (Path(PLUGIN_DIR) / "cluster.lua").read_text(encoding="utf-8")
+        self.assertIn("libkoreader-monolibtic", cluster_src)
+        self.assertIn("ffi.findlib", cluster_src)
 
 
 class TestRanking(unittest.TestCase):

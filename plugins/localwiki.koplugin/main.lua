@@ -155,6 +155,7 @@ function LocalWiki:init()
     self.ui.menu:registerToMainMenu(self)
     self:registerSelectionHooks()
     self:onDispatcherRegisterActions()
+
     if self.ui and self.ui.registerPostInitCallback then
         self.ui:registerPostInitCallback(function()
             self:registerSelectionHooks()
@@ -176,6 +177,20 @@ function LocalWiki:registerSelectionHooks()
     self:registerDictButtons()
     self:hookWikipediaModule()
     self:patchDictQuickLookup()
+
+    -- init() runs before ReaderUI has registered its dictionary module, so the
+    -- first attempt logs "addToDictButtons missing" and gives up. Retry once
+    -- per event-loop tick until the module shows up — cheap, and it means the
+    -- button survives whichever order the reader builds its modules in.
+    if not self._dict_retry_tries or self._dict_retry_tries < 40 then
+        if not (self.ui and self.ui.dictionary
+                and type(self.ui.dictionary.addToDictButtons) == "function") then
+            self._dict_retry_tries = (self._dict_retry_tries or 0) + 1
+            UIManager:scheduleIn(0.5, function()
+                if self.ui then self:registerDictButtons() end
+            end)
+        end
+    end
 end
 
 function LocalWiki:patchDictQuickLookup()
@@ -222,11 +237,10 @@ function LocalWiki:patchDictQuickLookup()
 
     local orig_buildButtonLayout = DictQuickLookup.buildButtonLayout
     DictQuickLookup.buildButtonLayout = function(dql_self)
-        if dql_self.ui and dql_self.ui.dictionary then
-            sanitizeDictLayout(dql_self.ui.dictionary)
-        end
-        sanitizeDictButtonConfig()
-
+        -- The layout sanitizers that used to run here removed
+        -- "wikipedia_offline" from the layout before every lookup, which is
+        -- exactly where the button has to survive. They are gone; see
+        -- registerDictButtons for why.
         local dict_mod = dql_self.ui and dql_self.ui.dictionary
         local orig_default_layout = dict_mod and dict_mod.default_layout
         local temp_layout = nil
@@ -272,14 +286,15 @@ function LocalWiki:patchDictQuickLookup()
 end
 
 function LocalWiki:addToHighlightDialog()
-    if not self.ui or not self.ui.highlight then return end
-    self.ui.highlight:addToHighlightDialog("05_wikipedia_offline", function(this)
+    if not self.ui or not self.ui.highlight or
+       type(self.ui.highlight.addToHighlightDialog) ~= "function" then
+        return
+    end
+    self.ui.highlight:addToHighlightDialog("05b_wikipedia_offline", function(this)
         return {
             id = "wikipedia_offline",
             text = _("Offline Wikipedia"),
-            show_in_highlight_dialog_func = function()
-                return not G_reader_settings:isTrue("localwiki_prefer_offline")
-            end,
+
             callback = function()
                 if this.hold_pos and not this.selected_text then
                     this:highlightFromHoldPos()
@@ -301,24 +316,35 @@ end
 
 function LocalWiki:registerDictButtons()
     if not self.ui or not self.ui.dictionary then return end
-    sanitizeDictLayout(self.ui.dictionary)
-    sanitizeDictButtonConfig()
+    -- NOTE: sanitizeDictLayout/sanitizeDictButtonConfig used to strip
+    -- "wikipedia_offline" out of the saved layout on every start. They were a
+    -- guard against KOReader choking on a layout entry whose button was never
+    -- registered — but the button is registered unconditionally now, and the
+    -- strip was what kept it out of an existing dict_button_config for good.
+    if type(self.ui.dictionary.addToDictButtons) ~= "function" then
+        -- KOReader before v2026.07 had no dictionary button registry at all
+        -- (no addToDictButtons, no _dict_buttons, no buildButtonLayout), so the
+        -- button simply cannot exist there. Bail out quietly instead of
+        -- writing into a table that does not exist.
+        return
+    end
     self.ui.dictionary:addToDictButtons({
         id = "wikipedia_offline",
         menu_text = _("Offline Wikipedia"),
         text = _("Offline Wikipedia"),
         can_shrink = true,
         pairs_with = "wikipedia",
-        conditional = true,
-        show_func = function(dict_popup)
-            if dict_popup.is_offline_wiki or dict_popup.is_wiki then
-                return false
-            end
-            if G_reader_settings:isTrue("localwiki_prefer_offline") then
-                return false
-            end
-            return true
-        end,
+        -- No `conditional` and no show_func here, deliberately.
+        --
+        -- KOReader only appends non-conditional buttons to `default_layout`
+        -- (see ReaderDictionary:_genCustomizeButtonsMenu). Conditional ones go
+        -- into `extra_layout`, which is merged only when a default_layout
+        -- exists — and on Android a `dict_button_config` is usually already
+        -- saved, leaving default_layout nil, so the button never rendered.
+        --
+        -- There is also no `show_func` field in KOReader's dictionary button
+        -- spec at all; the old one here was silently ignored. Visibility is
+        -- handled inside the callback instead.
         callback = function(dict_popup)
             local word = dict_popup.word
             if (not word or word == "") and dict_popup.highlight and dict_popup.highlight.selected_text then
@@ -735,10 +761,6 @@ function LocalWiki:_buildSubMenu()
             end,
             callback = function()
                 G_reader_settings:flipNilOrFalse("localwiki_prefer_offline")
-                if self.ui and self.ui.dictionary then
-                    sanitizeDictLayout(self.ui.dictionary)
-                end
-                sanitizeDictButtonConfig()
             end,
         },
         {
@@ -780,7 +802,7 @@ end
 -- ---------- about / update ----------
 
 local PLUGIN_REPO = "nar-io/localwiki.koplugin"
-local PLUGIN_VERSION = "0.6.5"
+local PLUGIN_VERSION = "0.6.8"
 local PLUGIN_ARCHIVE = "localwiki.koplugin.zip"
 
 function LocalWiki:showAbout()
@@ -1584,7 +1606,7 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
         local norm_cand = is_lower and (first_char:upper() .. cand:sub(#first_char + 1)) or cand
         if not prefix_seen[norm_cand] then
             prefix_seen[norm_cand] = true
-            local prefix_hits = self.library:prefixSearch("C", cand, max_results - #results)
+            local prefix_hits = self.library:prefixSearch("C", norm_cand, max_results - #results)
             for _, hit in ipairs(prefix_hits) do
                 local key = (hit._base or "") .. ":" .. (hit.url or "")
                 if not seen_keys[key] then
@@ -1617,7 +1639,14 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
         for _, h in ipairs(hits or {}) do
             if h.idx then indices[#indices + 1] = h.idx end
         end
-        for _, found in ipairs(z:entriesForIndices(indices)) do
+        local entries_ok, found_entries = pcall(function()
+            return z:entriesForIndices(indices)
+        end)
+        if not entries_ok or type(found_entries) ~= "table" then
+            logger.warn("localwiki: could not resolve title-index hits")
+            return
+        end
+        for _, found in ipairs(found_entries) do
             local key = base .. ":" .. (found.url or "")
             if not seen_keys[key] then
                 seen_keys[key] = true
@@ -1631,17 +1660,20 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
     if #query_words > 0 then
         for _, e in ipairs(self.library:activeZims()) do
             local z = self.library:open(e.base)
-            local word_idx
-            if z then
-                word_idx = self:_wordIndex(e.base)
-            end
-            if word_idx and z then
-                local hits = word_idx:lookup_all(query_words)
-                addTitleHits(e.base, z, hits)
-            elseif z and z.article_count <= TITLE_INDEX_MAX_ARTICLES then
-                local title_idx = self:_titleIndex(e.base)
-                if title_idx then
-                    addTitleHits(e.base, z, title_idx:lookup_all(query_words, 60))
+            if z and z.article_count <= TITLE_INDEX_MAX_ARTICLES then
+                local title_ok, title_idx = pcall(function() return self:_titleIndex(e.base) end)
+                if title_ok and title_idx then
+                    local lookup_ok, hits = pcall(function()
+                        return title_idx:lookup_all(query_words, 60)
+                    end)
+                    if lookup_ok and hits then
+                        local add_ok, add_err = pcall(function()
+                            addTitleHits(e.base, z, hits)
+                        end)
+                        if not add_ok then
+                            logger.warn("localwiki: title lookup failed for " .. e.base .. ": " .. tostring(add_err))
+                        end
+                    end
                 end
             elseif z then
                 logger.info(string.format(
@@ -2818,11 +2850,16 @@ function LocalWiki:showInLookupWindow(results, query, boxes, dict_close_callback
                 item.definition = decode_html_entities(entry.definition)
                 item.images = entry.images
             elseif #dict_results == 0 then
-                -- Preload intro extract and lead image for first (best match) result immediately
-                local intro, images, resolved = self:_loadArticleIntro(entry)
-                item.definition = intro
-                item.images = images
-                if resolved then item.zim_entry = resolved end
+                -- Preload the first result. This used to be skipped on Android
+                -- because eager cluster work crashed there; that crash was the
+                -- zstd streaming path (fixed in cluster.lua), not the lookup
+                -- window itself, so the platform special-case is gone.
+                local intro_ok, intro, images, resolved = pcall(function()
+                    return self:_loadArticleIntro(entry)
+                end)
+                item.definition = intro_ok and intro or _("Article preview unavailable.")
+                item.images = intro_ok and images or nil
+                if intro_ok and resolved then item.zim_entry = resolved end
             else
                 -- Lazy load intro extract and lead image for other matching articles on demand
                 setmetatable(item, {

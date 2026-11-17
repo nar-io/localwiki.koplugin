@@ -14,7 +14,7 @@ local logger = require("logger")
 pcall(ffi.cdef, [[
 /* libzstd — one-shot decompression API, plenty for our cluster sizes */
 size_t ZSTD_decompress(void* dst, size_t dstCap, const void* src, size_t srcSize);
-unsigned long long ZSTD_getFrameContentSize(const void* src, size_t srcSize);
+uint64_t ZSTD_getFrameContentSize(const void* src, size_t srcSize);
 unsigned ZSTD_isError(size_t code);
 const char* ZSTD_getErrorName(size_t code);
 
@@ -34,7 +34,36 @@ lzma_ret lzma_stream_buffer_decode(
     uint8_t *out, size_t *out_pos, size_t out_size);
 ]])
 
+-- Resolve a native library the way KOReader itself does.
+--
+-- Android is the awkward one: its libraries are unversioned (libzstd.so, not
+-- libzstd.so.1) and live in the APK's nativeLibraryDir, and on builds with the
+-- monolibtic bundle zstd is not a separate .so at all — it is a set of symbols
+-- inside libkoreader-monolibtic.so. Plain ffi.load("zstd") fails there, which
+-- is why the plugin said "libzstd not available" on Android.
+--
+-- ffi.findlib (installed by koreader-base/ffi/loadlib.lua at startup) already
+-- knows all of this: it redirects bundled names to the monolibtic path and
+-- searches nativeLibraryDir. Use it first, then fall back to ffi.load.
 local function try_load(names)
+    if ffi.findlib then
+        for _, n in ipairs(names) do
+            local ok, found = pcall(ffi.findlib, n, "1")
+            if ok and found and found ~= "" then
+                local load_ok, lib = pcall(ffi.load, found)
+                if load_ok and lib then return lib, found end
+            end
+        end
+        -- Android builds are unversioned.
+        for _, n in ipairs(names) do
+            local ok, found = pcall(ffi.findlib, n)
+            if ok and found and found ~= "" then
+                local load_ok, lib = pcall(ffi.load, found)
+                if load_ok and lib then return lib, found end
+            end
+        end
+    end
+
     for _, n in ipairs(names) do
         local ok, lib = pcall(ffi.load, n)
         if ok then return lib, n end
@@ -42,8 +71,43 @@ local function try_load(names)
     return nil
 end
 
-local zstd = try_load{ "zstd", "libzstd.so.1", "libzstd.so", "libzstd.1.dylib" }
-local lzma = try_load{ "lzma", "liblzma.so.5", "liblzma.so", "liblzma.5.dylib" }
+local zstd, zstd_path = try_load{
+    "zstd",
+    "libs/libkoreader-monolibtic",
+    "libkoreader-monolibtic",
+    "libzstd.so.1",
+    "libzstd.so",
+    "libzstd.1.dylib",
+}
+-- liblzma is not part of KOReader's monolibtic bundle on every platform
+-- (it is redirected on desktop builds but loaded separately on Android), so
+-- try the plain names first and fall back to the bundle path.
+local lzma, lzma_path = try_load{
+    "lzma",
+    "libs/libkoreader-monolibtic",
+    "libkoreader-monolibtic",
+    "libs/liblzma.so.5",
+    "liblzma.so.5",
+    "liblzma.so",
+    "liblzma.5.dylib",
+}
+
+-- Log the outcome once, at load time: on Android a failed symbol lookup shows
+-- up later as a SIGSEGV inside the FFI call (fault addr 0x0), which is far
+-- harder to diagnose than one line here.
+if zstd then
+    logger.info(string.format("localwiki: zstd loaded from %s", tostring(zstd_path)))
+    local ok_sym, sym = pcall(function() return zstd.ZSTD_decompress end)
+    logger.info(string.format("localwiki: ZSTD_decompress symbol = %s (%s)",
+        tostring(ok_sym and sym ~= nil), tostring(sym)))
+else
+    logger.warn("localwiki: zstd NOT available")
+end
+if lzma then
+    logger.info(string.format("localwiki: lzma loaded from %s", tostring(lzma_path)))
+else
+    logger.info("localwiki: lzma NOT available")
+end
 
 local Cluster = {}
 local M = {}
@@ -118,14 +182,28 @@ local function get_decomp_buf(size)
 end
 
 local function decompress_zstd(data)
-    if not zstd then error("libzstd not available — cannot read this ZIM") end
-    local src = ffi.cast("const char*", data)
-    local src_size = #data
+    if not zstd then
+        error("libzstd not available — cannot read compressed clusters. "
+            .. "This KOReader build ships zstd inside libkoreader-monolibtic.so; "
+            .. "report the device and KOReader version.")
+    end
+    -- Keep a strong reference to `data` for the whole call: ffi.cast gives C a
+    -- raw pointer into the Lua string's memory, and if the string is collected
+    -- mid-call (LuaJIT only tracks it through this local) the pointer dangles.
+    -- That shows up as SIGSEGV / SEGV_MAPERR at fault addr 0x0.
+    local src_buf = data
+    local src = ffi.cast("const char*", src_buf)
+    local src_size = #src_buf
     local frame_size = zstd.ZSTD_getFrameContentSize(src, src_size)
 
     -- Fast path: known content size, single call into reusable C buffer.
     if frame_size ~= UNKNOWN_SIZE and frame_size ~= ERROR_SIZE then
         local size = tonumber(frame_size)
+        -- A corrupt or truncated cluster can advertise a nonsense size; refuse
+        -- it here rather than handing it to the allocator.
+        if not size or size <= 0 or size > 64 * 1024 * 1024 then
+            error("zstd: implausible frame size " .. tostring(size))
+        end
         local dst = get_decomp_buf(size)
         local r = zstd.ZSTD_decompress(dst, size, src, src_size)
         if zstd.ZSTD_isError(r) ~= 0 then
@@ -134,11 +212,40 @@ local function decompress_zstd(data)
         return ffi.string(dst, tonumber(r))
     end
 
+    -- Frames without a content-size header (ZIM clusters built with streaming
+    -- compressors) report ZSTD_CONTENTSIZE_UNKNOWN. The streaming API used to
+    -- handle those, but it crashes on Android: KOReader's monolibtic zstd is
+    -- built without a usable ZSTD_DStream layout, so the very first
+    -- ZSTD_createDStream/ZSTD_decompressStream call faults at address 0x0.
+    -- Probe the decompressed size with a bounded retry loop instead — ZSTD
+    -- writes nothing past dstCapacity, so growing the buffer is safe.
+    do
+        local cap = math.max(src_size * 8, 2 * 1024 * 1024)
+        local limit = 64 * 1024 * 1024
+        while cap <= limit do
+            local dst = get_decomp_buf(cap)
+            local rr = zstd.ZSTD_decompress(dst, cap, src, src_size)
+            if zstd.ZSTD_isError(rr) == 0 then
+                return ffi.string(dst, tonumber(rr))
+            end
+            local name = ffi.string(zstd.ZSTD_getErrorName(rr))
+            -- dstSize_tooSmall is the only error that growth can fix.
+            if not name:find("Destination buffer is too small") then
+                error("zstd: " .. name)
+            end
+            cap = cap * 2
+        end
+        error("zstd: cluster larger than 64 MiB")
+    end
+
     -- Streaming fallback for frames without a content-size header.
     local zds = zstd.ZSTD_createDStream()
     if zds == nil then error("zstd: createDStream failed") end
     ffi.gc(zds, zstd.ZSTD_freeDStream)
-    zstd.ZSTD_initDStream(zds)
+    local init_r = zstd.ZSTD_initDStream(zds)
+    if zstd.ZSTD_isError(init_r) ~= 0 then
+        error("zstd: initDStream " .. ffi.string(zstd.ZSTD_getErrorName(init_r)))
+    end
     local in_buf  = ffi.new("ZSTD_inBuffer",  src, src_size, 0)
     local out_cap = 256 * 1024
     local out     = ffi.new("uint8_t[?]", out_cap)
@@ -168,9 +275,11 @@ local function decompress_lzma(data)
         local in_pos   = ffi.new("size_t[1]", 0)
         local out_pos  = ffi.new("size_t[1]", 0)
         local out      = ffi.new("uint8_t[?]", out_size)
+        -- Same GC hazard as zstd: hold the input string across the FFI call.
+        local src_hold = data
         local r = lzma.lzma_stream_buffer_decode(
             memlimit, 0, nil,
-            ffi.cast("const uint8_t*", data), in_pos, #data,
+            ffi.cast("const uint8_t*", src_hold), in_pos, #src_hold,
             out, out_pos, out_size)
         if r == 0 then
             return ffi.string(out, tonumber(out_pos[0]))
