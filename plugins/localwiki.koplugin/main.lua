@@ -16,10 +16,16 @@ of how many .zim?? part files it consists of on disk).
 local ButtonDialog = require("ui/widget/buttondialog")
 local InfoMessage = require("ui/widget/infomessage")
 local Font = require("ui/font")
+local Archiver = require("ffi/archiver")
+local ffiUtil = require("ffi/util")
 local InputDialog = require("ui/widget/inputdialog")
+local lfs = require("libs/libkoreader-lfs")
 local Menu = require("ui/widget/menu")
 local PathChooser = require("ui/widget/pathchooser")
+local socket = require("socket")
+local socketutil = require("socketutil")
 local UIManager = require("ui/uimanager")
+local util = require("util")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Device = require("device")
 local logger = require("logger")
@@ -774,7 +780,8 @@ end
 -- ---------- about / update ----------
 
 local PLUGIN_REPO = "nar-io/localwiki.koplugin"
-local PLUGIN_VERSION = "0.5.1"
+local PLUGIN_VERSION = "0.6.3"
+local PLUGIN_ARCHIVE = "localwiki.koplugin.zip"
 
 function LocalWiki:showAbout()
     local lines = {
@@ -866,11 +873,17 @@ function LocalWiki:checkForUpdates()
         return
     end
 
-    -- One row, two buttons: ButtonDialog expects buttons[row][col].
+    -- ButtonDialog expects buttons[row][col].
     UIManager:show(ButtonDialog:new{
         title = string.format(_("Version %s is available (you have %s)."), latest, PLUGIN_VERSION),
-        buttons = {{
-            {
+        buttons = {
+            {{
+                text = _("Update now"),
+                callback = function()
+                    self:_installUpdate(latest, data)
+                end,
+            }},
+            {{
                 text = _("Open release page"),
                 callback = function()
                     if self.ui and self.ui.openLinkDialog then
@@ -878,10 +891,116 @@ function LocalWiki:checkForUpdates()
                             "https://github.com/%s/releases/latest", PLUGIN_REPO))
                     end
                 end,
-            },
-            { text = _("Close"), callback = function() end },
-        }},
+            }},
+            {{ text = _("Close"), callback = function() end }},
+        },
     })
+end
+
+local function pluginDirectory()
+    local source = debug.getinfo(1, "S").source or ""
+    if source:sub(1, 1) == "@" then source = source:sub(2) end
+    return source:match("^(.*)/[^/]+$")
+end
+
+function LocalWiki:_installUpdate(version, release)
+    local plugin_dir = pluginDirectory()
+    local plugins_dir = plugin_dir and plugin_dir:match("^(.*)/[^/]+$")
+    if not plugin_dir or not plugins_dir then
+        UIManager:show(InfoMessage:new{ text = _("Could not locate the LocalWiki plugin folder.") })
+        return
+    end
+
+    local asset_url
+    for _, asset in ipairs(release.assets or {}) do
+        if asset.name == PLUGIN_ARCHIVE then
+            asset_url = asset.browser_download_url or asset.url
+            break
+        end
+    end
+    if not asset_url then
+        UIManager:show(InfoMessage:new{ text = _("The selected release has no plugin archive.") })
+        return
+    end
+
+    local stamp = tostring(os.time())
+    local archive_path = plugins_dir .. "/." .. PLUGIN_ARCHIVE .. "." .. stamp
+    local temp_dir = plugins_dir .. "/.localwiki-update-" .. stamp
+    local archive_file = io.open(archive_path, "wb")
+    if not archive_file then
+        UIManager:show(InfoMessage:new{ text = _("Could not create the update download file.") })
+        return
+    end
+
+    UIManager:show(InfoMessage:new{ text = _("Downloading update…") })
+    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    local code, headers, status = socket.skip(1, socket.http.request{
+        url = asset_url,
+        headers = { ["User-Agent"] = "localwiki-koplugin/" .. PLUGIN_VERSION },
+        sink = socketutil.file_sink(archive_file),
+    })
+    socketutil:reset_timeout()
+    if code ~= 200 then
+        archive_file:close()
+        os.remove(archive_path)
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("Update download failed (HTTP %s)."), tostring(status or code)),
+        })
+        return
+    end
+
+    local made, make_err = util.makePath(temp_dir)
+    if not made then
+        os.remove(archive_path)
+        UIManager:show(InfoMessage:new{ text = tostring(make_err or _("Could not create an update folder.")) })
+        return
+    end
+
+    local arc = Archiver.Reader:new()
+    local opened = arc:open(archive_path)
+    local extracted = opened
+    if opened then
+        for entry in arc:iterate() do
+            local path = entry.path or ""
+            if path:sub(1, 1) == "/" or path == ".." or
+                path:sub(1, 3) == "../" or path:find("/../", 1, true) or
+                path:sub(-3) == "/.." then
+                extracted = false
+                break
+            end
+            if not arc:extractToPath(path, temp_dir .. "/" .. path) then
+                extracted = false
+                break
+            end
+        end
+        extracted = extracted and not arc.err
+    end
+    arc:close()
+    os.remove(archive_path)
+
+    local new_plugin_dir = temp_dir .. "/localwiki.koplugin"
+    if not extracted or not lfs.attributes(new_plugin_dir, "mode") then
+        ffiUtil.purgeDir(temp_dir)
+        UIManager:show(InfoMessage:new{ text = _("Could not unpack the update archive.") })
+        return
+    end
+
+    self.library:closeAll()
+    local backup_dir = plugin_dir .. ".bak-" .. stamp
+    if not os.rename(plugin_dir, backup_dir) then
+        ffiUtil.purgeDir(temp_dir)
+        UIManager:show(InfoMessage:new{ text = _("Could not replace the current plugin folder.") })
+        return
+    end
+    local installed = os.rename(new_plugin_dir, plugin_dir)
+    ffiUtil.purgeDir(temp_dir)
+    if not installed then
+        os.rename(backup_dir, plugin_dir)
+        UIManager:show(InfoMessage:new{ text = _("Could not install the downloaded update.") })
+        return
+    end
+
+    UIManager:askForRestart(string.format(_("LocalWiki %s was installed. Restart KOReader to finish the update."), version))
 end
 
 -- List every discovered ZIM with a switch. Disabled archives are skipped by
