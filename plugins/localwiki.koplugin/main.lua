@@ -681,7 +681,7 @@ end
 function LocalWiki:addToMainMenu(menu_items)
     menu_items.localwiki = {
         text = _("Wikipedia (offline)"),
-        sorting_hint = "more_tools",
+        sorting_hint = "search",
         sub_item_table_func = function() return self:_buildSubMenu() end,
     }
 end
@@ -780,7 +780,7 @@ end
 -- ---------- about / update ----------
 
 local PLUGIN_REPO = "nar-io/localwiki.koplugin"
-local PLUGIN_VERSION = "0.6.3"
+local PLUGIN_VERSION = "0.6.4"
 local PLUGIN_ARCHIVE = "localwiki.koplugin.zip"
 
 function LocalWiki:showAbout()

@@ -868,6 +868,14 @@ class TestWikipediaFullPageStylingAndStructure(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+class TestMainMenu(unittest.TestCase):
+    def test_localwiki_is_in_search_menu_not_more_tools(self):
+        main_src = (Path(PLUGIN_DIR) / "main.lua").read_text(encoding="utf-8")
+        self.assertIn('sorting_hint = "search"', main_src)
+        self.assertNotIn('sorting_hint = "more_tools"', main_src)
+
+
 class TestRanking(unittest.TestCase):
     """The rank() key in main.lua decides which article a reader sees first."""
 
