@@ -1,3 +1,4 @@
+from pathlib import Path
 #!/usr/bin/env python3
 """
 Comprehensive automated test suite for KOReader Offline Wikipedia integration.
@@ -867,6 +868,74 @@ class TestWikipediaFullPageStylingAndStructure(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+class TestRanking(unittest.TestCase):
+    """The rank() key in main.lua decides which article a reader sees first."""
+
+    @staticmethod
+    def _rank(url, size, query):
+        q_lower = query.lower().replace(" ", "_")
+        query_key = query.replace(" ", "_")
+        exact = url == query_key or url.lower() == q_lower
+        words = len([w for w in url.split("_") if w])
+        last = url.lower().rsplit("_", 1)[-1] if "_" in url else url.lower()
+        suffix_hit = last == q_lower
+        if exact:
+            tier = 0
+        elif words <= 3:
+            tier = 1
+        elif words == 1:
+            tier = 2
+        else:
+            tier = 3
+        # Mirrors main.lua: no size key, suffix hit then title length.
+        return tier, (0 if suffix_hit else 1), len(url), url
+
+    def test_exact_title_is_first_tier(self):
+        self.assertEqual(self._rank("Charizard", 372_000, "Charizard")[0], 0)
+
+    def test_exact_title_lowercase_also_tier_zero(self):
+        # A prefix hit can return the same article with different casing.
+        self.assertEqual(self._rank("charizard", 372_000, "Charizard")[0], 0)
+
+    def test_suffix_hit_wins_inside_a_tier(self):
+        # "Severus_Snape" ends with the query, "Snape's_Bias" does not; the
+        # person should come first even without size information.
+        person = self._rank("Severus_Snape", 0, "Snape")
+        detail = self._rank("Snape's_Bias", 0, "Snape")
+        self.assertEqual(person[0], detail[0])
+        self.assertLess(person[1], detail[1])
+
+    def test_short_titles_share_one_tier(self):
+        # "Severus_Snape" and "Snape_with_Thorp" are both short titles about
+        # the query; size decides between them, not word order.
+        person = self._rank("Severus_Snape", 495_000, "Snape")
+        place = self._rank("Snape_with_Thorp", 95_000, "Snape")
+        self.assertEqual(person[0], place[0])
+        self.assertLess(person[1], place[1])
+
+    def test_shorter_title_wins_when_neither_ends_with_query(self):
+        # Without size, title length is the tie-breaker inside a tier.
+        short = self._rank("Snape_Thorp", 0, "Snape")
+        longer = self._rank("Snape_Thorp_More", 0, "Snape")
+        self.assertEqual(short[0], longer[0])
+        self.assertLess(short[2], longer[2])
+
+    def test_ranking_does_not_measure_article_size(self):
+        # Measuring a size costs a cluster decompression; doing that per hit
+        # OOM-killed the reader on a 485 MB device. Ranking must not call it.
+        main_src = (Path(PLUGIN_DIR) / "main.lua").read_text(encoding="utf-8")
+        lib_src = (Path(PLUGIN_DIR) / "library.lua").read_text(encoding="utf-8")
+        self.assertNotIn("z.blobSize", main_src)
+        self.assertNotIn("z.blobSize", lib_src)
+
+    def test_startup_indexing_hook_exists(self):
+        src = (Path(PLUGIN_DIR) / "main.lua").read_text(encoding="utf-8")
+        self.assertIn("_indexOnStartup", src)
+        self.assertIn("has_index", src)
 
 
-
+class TestWordIndexProgress(unittest.TestCase):
+    def test_open_accepts_progress_callback(self):
+        src = (Path(PLUGIN_DIR) / "wordindex.lua").read_text(encoding="utf-8")
+        self.assertIn("on_progress", src)
+        self.assertIn("function WordIndex.has_index", src)

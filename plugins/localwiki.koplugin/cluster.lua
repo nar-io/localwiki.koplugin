@@ -225,6 +225,14 @@ function M.parse(info_byte, body)
     }, Cluster)
 end
 
+-- Byte length of one blob, without slicing the payload.
+function Cluster:blobSize(idx)
+    if idx < 0 or idx >= self.num_blobs then return 0 end
+    local lo = self.read_off(self.payload, idx * self.off_size + 1)
+    local hi = self.read_off(self.payload, (idx + 1) * self.off_size + 1)
+    return hi - lo
+end
+
 function Cluster:getBlob(idx)
     if idx < 0 or idx >= self.num_blobs then return nil end
     -- offsets table is at the start of payload; offset[i] is at byte i*off_size+1

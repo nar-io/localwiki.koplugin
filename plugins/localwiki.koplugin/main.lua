@@ -28,6 +28,7 @@ local ok_dict, DictQuickLookup = pcall(require, "ui/widget/dictquicklookup")
 
 local Library = require("library")
 local TitleIndex = require("titleindex")
+local WordIndex = require("wordindex")
 local Viewer = require("viewer")
 local HtmlClean = require("htmlclean")
 
@@ -37,6 +38,8 @@ local SETTING_FONT        = "localwiki_font_size"
 local SETTING_FACE        = "localwiki_font_face"
 local SETTING_SPACING     = "localwiki_line_spacing"
 local SETTING_MARGIN      = "localwiki_margin_em"
+local SETTING_DISABLED_ZIMS = "localwiki_disabled_zims"
+local SETTING_IMAGE_LIMIT = "localwiki_image_limit"
 local LEGACY_PATH_SETTING = "wikipediazim_path"   -- old single-file setting
 
 local DEFAULT_FOLDER = "/mnt/us/wikipedia"
@@ -382,6 +385,58 @@ function LocalWiki:_folder()
     return G_reader_settings:readSetting(SETTING_FOLDER) or DEFAULT_FOLDER
 end
 
+function LocalWiki:_imageLimit()
+    local limit = G_reader_settings:readSetting(SETTING_IMAGE_LIMIT)
+    if type(limit) == "number" and (limit == -1 or limit >= 0) then return limit end
+    -- Preserve the old toggle for users upgrading from the boolean setting.
+    if G_reader_settings:readSetting("localwiki_show_images") == false then
+        return 0
+    end
+    return 4
+end
+
+local IMAGE_LIMITS = { 0, 1, 2, 3, 4, 5, 6, 10, -1 }
+
+local function imageLimitLabel(limit)
+    if limit == 0 then return _("No images") end
+    if limit < 0 then return _("All") end
+    return tostring(limit)
+end
+
+function LocalWiki:_imageLimitMenu()
+    local items = {}
+    for _, limit in ipairs(IMAGE_LIMITS) do
+        items[#items + 1] = {
+            text = imageLimitLabel(limit),
+            checked_func = function() return self:_imageLimit() == limit end,
+            callback = function()
+                G_reader_settings:saveSetting(SETTING_IMAGE_LIMIT, limit)
+                self._article_lru = nil
+                self._article_lru_keys = nil
+            end,
+        }
+    end
+    return items
+end
+
+function LocalWiki:_saveDisabledZims()
+    local disabled = {}
+    for base, is_disabled in pairs(self.library.disabled or {}) do
+        if is_disabled then disabled[base] = true end
+    end
+    G_reader_settings:saveSetting(SETTING_DISABLED_ZIMS, disabled)
+end
+
+function LocalWiki:_restoreDisabledZims()
+    local saved = G_reader_settings:readSetting(SETTING_DISABLED_ZIMS)
+    if type(saved) ~= "table" then return end
+    for base, is_disabled in pairs(saved) do
+        if is_disabled and self.library.by_base[base] then
+            self.library:setDisabled(base, true)
+        end
+    end
+end
+
 -- Title index for one logical ZIM, read once from the archive's own
 -- titleOrdered listing and cached for the session. This replaces the old
 -- word index: no scan, no per-word tables, no OOM on large wikis.
@@ -390,6 +445,16 @@ end
 -- moment the index was built. Their prefix search is good enough, and their
 -- titles are far more predictable than a fandom wiki's.
 local TITLE_INDEX_MAX_ARTICLES = 200000
+local WORD_INDEX_MAX_ARTICLES = 100000
+-- libzim's Python Item API stores custom items in the C namespace, so keep
+-- the internal marker in the URL and look it up as a normal C entry.
+local POPULARITY_PATH = "X/localwiki/popularity/v1"
+
+local function read_u32_le(data, pos)
+    local a, b, c, d = data:byte(pos, pos + 3)
+    if not d then return nil end
+    return a + b * 256 + c * 65536 + d * 16777216
+end
 
 function LocalWiki:_titleIndex(base)
     if not self._title_indexes then self._title_indexes = {} end
@@ -406,7 +471,9 @@ function LocalWiki:_titleIndex(base)
         self._title_indexes[base] = false
         return nil
     end
-    local entries = TitleIndex.load(z)
+    local cache_path = self.library:pathOf(base)
+    if cache_path then cache_path = cache_path .. ".titleidx" end
+    local entries = TitleIndex.load(z, cache_path)
     if not entries then
         self._title_indexes[base] = false
         return nil
@@ -415,6 +482,71 @@ function LocalWiki:_titleIndex(base)
     logger.info(string.format("localwiki: title index for %s has %d entries", base, idx:entryCount()))
     self._title_indexes[base] = idx
     return idx
+end
+
+function LocalWiki:_wordIndex(base)
+    if not self._word_indexes then self._word_indexes = {} end
+    if self._word_indexes[base] ~= nil then
+        return self._word_indexes[base] or nil
+    end
+    local z = self.library:open(base)
+    local path = self.library:pathOf(base)
+    if not z or not path or z.article_count > WORD_INDEX_MAX_ARTICLES then
+        self._word_indexes[base] = false
+        return nil
+    end
+    local idx = WordIndex.open(z, path)
+    self._word_indexes[base] = idx or false
+    return idx
+end
+
+function LocalWiki:_popularity(base, z)
+    if not self._popularity_indexes then self._popularity_indexes = {} end
+    if self._popularity_indexes[base] ~= nil then
+        return self._popularity_indexes[base] or nil
+    end
+    local entry = z:findExact("C", POPULARITY_PATH)
+    if not entry or entry.kind ~= "article" then
+        self._popularity_indexes[base] = false
+        return nil
+    end
+    local data = z:readBlob(entry.cluster, entry.blob)
+    if not data or data:sub(1, 5) ~= "LWPS\0" then
+        self._popularity_indexes[base] = false
+        return nil
+    end
+    local version = read_u32_le(data, 6)
+    local count = read_u32_le(data, 10)
+    if version ~= 1 or not count then
+        self._popularity_indexes[base] = false
+        return nil
+    end
+    local scores = {}
+    local pos = 14
+    for _ = 1, count do
+        local len_lo, len_hi = data:byte(pos, pos + 1)
+        if not len_hi then
+            scores = nil
+            break
+        end
+        local len = len_lo + len_hi * 256
+        pos = pos + 2
+        if pos + len + 3 > #data then
+            scores = nil
+            break
+        end
+        local title = data:sub(pos, pos + len - 1)
+        pos = pos + len
+        local score = read_u32_le(data, pos)
+        pos = pos + 4
+        if not score then
+            scores = nil
+            break
+        end
+        scores[title] = score
+    end
+    self._popularity_indexes[base] = scores or false
+    return scores
 end
 
 -- Nothing to prebuild any more. The title listing is read straight from each
@@ -428,6 +560,7 @@ function LocalWiki:_ensureScanned()
     if self._scanned then return #self.library.zims > 0 end
     self._scanned = true
     self.library:scan(self:_folder())
+    self:_restoreDisabledZims()
     return #self.library.zims > 0
 end
 
@@ -615,16 +748,10 @@ function LocalWiki:_buildSubMenu()
             end,
         },
         {
-            text = _("Show images in articles"),
-            checked_func = function()
-                return G_reader_settings:nilOrTrue("localwiki_show_images")
+            text_func = function()
+                return _("Images: ") .. imageLimitLabel(self:_imageLimit())
             end,
-            callback = function()
-                G_reader_settings:flipNilOrTrue("localwiki_show_images")
-                -- Cached HTML was built with the previous setting.
-                self._article_lru = nil
-                self._article_lru_keys = nil
-            end,
+            sub_item_table_func = function() return self:_imageLimitMenu() end,
         },
         {
             text = _("About LocalWiki"),
@@ -783,6 +910,7 @@ function LocalWiki:showLoadedZims()
             text = label,
             callback = function()
                 self.library:setDisabled(e.base, on)
+                self:_saveDisabledZims()
                 UIManager:close(self._zim_dialog)
                 self._zim_dialog = nil
                 self:showLoadedZims()
@@ -796,6 +924,7 @@ function LocalWiki:showLoadedZims()
             for _i, e in ipairs(self.library.zims) do
                 self.library:setDisabled(e.base, false)
             end
+            self:_saveDisabledZims()
             UIManager:close(self._zim_dialog)
             self._zim_dialog = nil
             self:showLoadedZims()
@@ -1304,6 +1433,12 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
     local candidates = self:_getSearchCandidates(query)
     local results = {}
     local seen_keys = {}
+    local function attachPopularity(hit)
+        if not hit._base then return end
+        local z = self.library:open(hit._base)
+        local popularity = z and self:_popularity(hit._base, z)
+        hit._popularity = popularity and popularity[hit.url] or 0
+    end
 
     -- 1. Prefer exact title matches across all ZIMs (best match first)
     for _, cand in ipairs(candidates) do
@@ -1312,6 +1447,7 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
             local key = (hit._base or "") .. ":" .. (hit.url or "")
             if not seen_keys[key] then
                 seen_keys[key] = true
+                attachPopularity(hit)
                 results[#results + 1] = hit
             end
         end
@@ -1334,8 +1470,7 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
                 local key = (hit._base or "") .. ":" .. (hit.url or "")
                 if not seen_keys[key] then
                     seen_keys[key] = true
-                    -- _size is filled in by Library:prefixSearch so ranking
-                    -- can compare prefix hits with word-index hits.
+                    attachPopularity(hit)
                     results[#results + 1] = hit
                     if #results >= max_results then break end
                 end
@@ -1353,40 +1488,46 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
         w = w:gsub("'s$", ""):gsub("'$", "")
         if #w >= 2 then query_words[#query_words + 1] = w end
     end
-    -- The title listing is read straight from the archive, so there is no
-    -- article-count ceiling: a 1.8M-article Wikipedia costs one sequential
-    -- read of its listing, not a full scan.
+    local pending_scans = {}
+    local scan_zims = {}
+    local finishSearch
+
+    local function addTitleHits(base, z, hits)
+        local popularity = self:_popularity(base, z)
+        local indices = {}
+        for _, h in ipairs(hits or {}) do
+            if h.idx then indices[#indices + 1] = h.idx end
+        end
+        for _, found in ipairs(z:entriesForIndices(indices)) do
+            local key = base .. ":" .. (found.url or "")
+            if not seen_keys[key] then
+                seen_keys[key] = true
+                found._base = base
+                found._popularity = popularity and popularity[found.url] or 0
+                results[#results + 1] = found
+            end
+        end
+    end
+
     if #query_words > 0 then
         for _, e in ipairs(self.library:activeZims()) do
             local z = self.library:open(e.base)
-            local idx
+            local word_idx
             if z then
-                idx = self:_titleIndex(e.base)
+                word_idx = self:_wordIndex(e.base)
             end
-            if idx and z then
-                local hits = idx:lookup_all(query_words, 60)
-                if hits then
-                    -- Each hit carries its directory index, so resolving one
-                    -- is a single read — no binary search per result.
-                    local indices = {}
-                    for _, h in ipairs(hits) do
-                        -- A nil idx would make entriesForIndices skip the hit
-                        -- silently; the index always writes one, so a nil here
-                        -- means a corrupt entry and the hit is dropped.
-                        if h.idx then indices[#indices + 1] = h.idx end
-                    end
-                    for _, found in ipairs(z:entriesForIndices(indices)) do
-                        local key = e.base .. ":" .. (found.url or "")
-                        if not seen_keys[key] then
-                            seen_keys[key] = true
-                            found._base = e.base
-                            -- No size: one cluster decompression per hit is
-                            -- what made searches slow and got the reader
-                            -- OOM-killed. Ranking uses title shape instead.
-                            results[#results + 1] = found
-                        end
-                    end
+            if word_idx and z then
+                local hits = word_idx:lookup_all(query_words)
+                addTitleHits(e.base, z, hits)
+            elseif z and z.article_count <= TITLE_INDEX_MAX_ARTICLES then
+                local title_idx = self:_titleIndex(e.base)
+                if title_idx then
+                    addTitleHits(e.base, z, title_idx:lookup_all(query_words, 60))
                 end
+            elseif z then
+                logger.info(string.format(
+                    "localwiki: skipping title search for large archive %s (%d articles)",
+                    e.base, z.article_count))
             end
         end
     end
@@ -1401,6 +1542,7 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
     --   2. a short title (two or three words)
     --   3. everything else, shortest first
     -- Ties fall back to alphabetical so the list is stable between searches.
+    finishSearch = function()
     local query_key = query:gsub(" ", "_")
     local q_lower = query:lower():gsub(" ", "_")
     -- A prefix hit whose title *is* the query is the same article the exact
@@ -1447,13 +1589,14 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
         -- be the better key, but measuring it costs a cluster decompression
         -- per result — the reader was OOM-killed doing exactly that on this
         -- device, so title shape carries the ranking instead.
-        return tier, (suffix_hit and 0 or 1), #url, url
+        return tier, (suffix_hit and 0 or 1), -(entry._popularity or 0), #url, url
     end
     table.sort(results, function(a, b)
-        local at, as, al, au = rank(a)
-        local bt, bs, bl, bu = rank(b)
+        local at, as, ap, al, au = rank(a)
+        local bt, bs, bp, bl, bu = rank(b)
         if at ~= bt then return at < bt end
         if as ~= bs then return as < bs end
+        if ap ~= bp then return ap < bp end
         if al ~= bl then return al < bl end
         return au < bu
     end)
@@ -1480,6 +1623,20 @@ function LocalWiki:runSearch(query, boxes, dict_close_callback)
     end
 
     self:showInLookupWindow(results, query, boxes, dict_close_callback)
+    end
+
+    if #pending_scans > 0 then
+        self:_scanTitleMatchesAsync(pending_scans, function(hits)
+            for _, hit in ipairs(hits) do
+                local z = scan_zims[hit._base]
+                if z then addTitleHits(hit._base, z, { hit }) end
+            end
+            finishSearch()
+        end)
+        return
+    end
+
+    finishSearch()
 end
 
 local function base64_encode(data)
@@ -1903,8 +2060,8 @@ function LocalWiki:_embedImagesInHtml(z, html, article_url)
     if not html or html == "" then return html end
 
     local BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
-    local show_image = G_reader_settings:nilOrTrue("localwiki_show_images")
-    if not show_image then
+    local max_images = self:_imageLimit()
+    if max_images == 0 then
         -- Images off: drop the pictures *and* the text that describes them.
         -- Blanking only the source leaves the <img> width/height attributes in
         -- place (a hole in the text) and keeps the caption (a stray sentence),
@@ -1923,10 +2080,8 @@ function LocalWiki:_embedImagesInHtml(z, html, article_url)
 
     -- Cap the pictures embedded into one article. Each decoded bitmap is a
     -- full-size RGB buffer and a Fandom page can carry a thousand <img> tags,
-    -- so a generous cap is what pushes a 512 MB Kindle into the OOM killer.
-    -- Pictures are also skipped entirely on low-memory devices: the MuPDF
-    -- document plus its layout cache already fills the budget there.
-    local max_images = 6
+    -- so an explicit cap avoids pushing a 512 MB Kindle into the OOM killer.
+    -- A negative limit means unlimited images.
     local count = 0
 
     local replaced_html = html
@@ -1937,7 +2092,7 @@ function LocalWiki:_embedImagesInHtml(z, html, article_url)
         local sq = string.char(39)
 
         local function replace_and_wrap(tag_start, src, tag_end)
-            if is_decorative_icon(src) or count >= max_images then
+            if is_decorative_icon(src) or (max_images > 0 and count >= max_images) then
                 return tag_start .. BLANK_GIF .. tag_end
             end
             local filename = self:_resolveImageFile(z, src)
@@ -2067,9 +2222,8 @@ end
 
 function LocalWiki:_getLeadImageBlitBuffer(z, raw_html, cleaned_html, article_url)
     if not z then return nil end
-    -- Deliberately not tied to the "Show images in articles" setting: that
-    -- switch is about the article view. The lookup popup is a single small
-    -- picture that helps identify the article, and it stays either way.
+    -- Deliberately not tied to the article image limit: the lookup popup is a
+    -- single small picture that helps identify the article, and it stays either way.
 
     local src, caption = self:_findLeadImageSrc(raw_html, article_url, z)
     if not src and cleaned_html then

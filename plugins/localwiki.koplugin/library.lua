@@ -226,6 +226,14 @@ function Library:findExact(namespace, target_url)
     return out
 end
 
+-- Absolute path of the logical ZIM's first part, for things that need to
+-- read the file directly (the word index).
+function Library:pathOf(base)
+    local entry = self.by_base[base]
+    if not entry then return nil end
+    return entry.paths and entry.paths[1]
+end
+
 -- Number of *opened* (i.e. file-handle-active) ZIMs — for diagnostics.
 function Library:openedCount()
     local n = 0

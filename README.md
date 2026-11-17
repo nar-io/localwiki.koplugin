@@ -16,7 +16,7 @@ Browse and search offline [Kiwix ZIM files](https://library.kiwix.org/) directly
 - **Optimized for E-ink:** Sanitizes heavy Wikipedia Vector skin HTML, navigation templates, and unrenderable CSS for fast, responsive rendering via MuPDF.
 - **Lookup & Dictionary Integration:** Integrates into KOReader's dictionary quick lookup and text selection menu.
 - **Offline Link Navigation:** Tap internal article links to jump between articles, complete with full back/forward history navigation.
-- **Customizable Reading:** Font size, font face, line spacing and text margin are all adjustable from the reader toolbar. Images can be switched off for a text-only view.
+- **Customizable Reading:** Font size, font face, line spacing and text margin are all adjustable from the reader toolbar. Article images can be limited from none to all.
 
 ---
 

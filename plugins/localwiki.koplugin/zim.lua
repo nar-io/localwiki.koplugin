@@ -253,6 +253,25 @@ function ZIM:_readUrlAt(off)
     return ns, read_cstring(f)
 end
 
+-- Resolve many paths by their directory index.
+--
+-- The word index stores each article's index into the URL pointer table, so
+-- resolving a hit is one seek and one small read — no binary search at all.
+-- `indices` is a sorted array of entry indices.
+function ZIM:entriesForIndices(indices)
+    local out = {}
+    if not indices then return out end
+    for _, idx in ipairs(indices) do
+        if idx >= 0 and idx < self.article_count then
+            local entry = self:getEntryByIndex(idx)
+            if entry and entry.kind ~= "deleted" then
+                out[#out + 1] = entry
+            end
+        end
+    end
+    return out
+end
+
 function ZIM:getEntryByIndex(idx)
     if idx < 0 or idx >= self.article_count then return nil end
     local off = self:_direntOffset(idx)
@@ -449,6 +468,66 @@ function ZIM:readBlob(cluster_num, blob_num)
         self.cluster_cache:put(cluster_num, cached)
     end
     return cached:getBlob(blob_num)
+end
+
+-- Sizes of every blob in one cluster, as an array.
+-- The word index needs a size for each article; asking per article would
+-- re-read and re-inflate the same cluster thousands of times (47k articles
+-- live in only ~500 clusters), which is what made indexing run out of memory.
+function ZIM:clusterBlobSizes(cluster_num)
+    -- Deliberately does NOT go through cluster_cache. The index build walks
+    -- every cluster in order, and caching each parsed payload (compressed and
+    -- inflated copies alive at once) peaked near 1 GB on a 493-cluster wiki —
+    -- more than the device has. Parse, read the sizes, drop the payload.
+    local cstart, cend = self:_clusterRange(cluster_num)
+    self.file:seek("set", cstart)
+    local info = self.file:read(1):byte(1)
+    local data = self.file:read(cend - cstart - 1)
+    local parsed = Cluster.parse(info, data)
+    local sizes = {}
+    for i = 0, parsed.num_blobs - 1 do
+        sizes[i] = parsed:blobSize(i)
+    end
+    parsed.payload = nil
+    parsed = nil
+    data = nil
+    return sizes
+end
+
+-- Size of one blob, and do not keep the parsed cluster around.
+-- The word index asks for tens of thousands of sizes while building; caching
+-- every cluster's decompressed payload (493 clusters, ~1 MB each on a
+-- 47k-article wiki) exhausted a 485 MB device and the kernel killed the
+-- reader mid-build.
+function ZIM:clusterBlobSize(cluster_num, blob_num)
+    local cached = self.cluster_cache:get(cluster_num)
+    if cached then
+        return cached:blobSize(blob_num)
+    end
+    local cstart, cend = self:_clusterRange(cluster_num)
+    self.file:seek("set", cstart)
+    local info = self.file:read(1):byte(1)
+    local data = self.file:read(cend - cstart - 1)
+    local parsed = Cluster.parse(info, data)
+    local size = parsed:blobSize(blob_num)
+    parsed.payload = nil
+    return size
+end
+
+-- Size of a blob without copying it out of the cluster.
+-- Used by the word index to rank big "main" articles above small detail
+-- articles; reading the bytes just to call #content would double the cost.
+function ZIM:blobSize(cluster_num, blob_num)
+    local cached = self.cluster_cache:get(cluster_num)
+    if not cached then
+        local cstart, cend = self:_clusterRange(cluster_num)
+        self.file:seek("set", cstart)
+        local info = self.file:read(1):byte(1)
+        local data = self.file:read(cend - cstart - 1)
+        cached = Cluster.parse(info, data)
+        self.cluster_cache:put(cluster_num, cached)
+    end
+    return cached:blobSize(blob_num)
 end
 
 function ZIM:readArticle(entry)
