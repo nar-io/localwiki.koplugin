@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] — 2026-11-17
+
+### Added
+- Improved article search and ranking for titles that contain the query.
+- Popularity metadata support for scored ZIM archives.
+- Persistent archive enable/disable settings.
+- Image limits from no images to all images in full articles.
+- LocalWiki plugin icon and simplified user documentation.
+
 ## [0.5.1] — Unreleased
 
 ### Fixed
