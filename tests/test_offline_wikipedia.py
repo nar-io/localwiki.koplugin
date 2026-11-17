@@ -862,7 +862,7 @@ class TestWikipediaFullPageStylingAndStructure(unittest.TestCase):
             src = f.read()
 
         self.assertIn("HtmlClean.clean(html, true, self.current_title, {", src)
-        self.assertIn("max_images = 6", src)
+        self.assertIn("max_images = self:_imageLimit()", src)
 
 
 if __name__ == "__main__":
@@ -931,7 +931,7 @@ class TestRanking(unittest.TestCase):
     def test_startup_indexing_hook_exists(self):
         src = (Path(PLUGIN_DIR) / "main.lua").read_text(encoding="utf-8")
         self.assertIn("_indexOnStartup", src)
-        self.assertIn("has_index", src)
+        self.assertNotIn("has_index", src)
 
 
 class TestWordIndexProgress(unittest.TestCase):
